@@ -460,13 +460,14 @@ create_test_db() {
 
 	# Check if database already exists
 	if "$psql_bin" -lqt | cut -d \| -f 1 | grep -qw "$test_dbname"; then
-		log_info "Database '$test_dbname' already exists, dropping and recreating..."
-		"$psql_bin" -c "DROP DATABASE IF EXISTS $test_dbname;" postgres
+		log_info "Database '$test_dbname' already exists, using it..."
+		# log_info "Database '$test_dbname' already exists, dropping and recreating..."
+		# "$psql_bin" -c "DROP DATABASE IF EXISTS $test_dbname;" postgres
+	else
+		# Create database
+		log_info "Creating database '$test_dbname'..."
+		"$createdb_bin" "$test_dbname" || log_error "Failed to create database"
 	fi
-
-	# Create database
-	log_info "Creating database '$test_dbname'..."
-	"$createdb_bin" "$test_dbname" || log_error "Failed to create database"
 
 	# Create schema based on user choice
 	if [ "$SIMPLE_SCHEMA" = true ]; then
@@ -618,10 +619,6 @@ main() {
 	# Validate options
 	if [ "$DO_INIT" = true ] && [ "$DO_BUILD" != true ]; then
 		log_error "Option --init requires --build"
-	fi
-
-	if [ "$DO_TEST_DATA" = true ] && [ "$DO_INIT" != true ]; then
-		log_error "Option --test-data requires --init"
 	fi
 
 	# Map version to branch
