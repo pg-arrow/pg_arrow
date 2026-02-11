@@ -15,6 +15,7 @@
 - `src/util/`: Helper utilities
 - `docs/design/DESIGN.md`: Main design document (~6000+ lines, TOC at top, changelog at top)
 - `RESEARCH/WAL_FORMAT.md`: WAL file physical format reference (~1900 lines, Rust struct definitions)
+- `docs/PROFILING_AND_DEBUGGING.md`: Profiling tools, tracing setup, debugging binary parsing and concurrency
 
 When adding new sub-crates or modules (e.g., `pg_arrow_core`, `pg_arrow_logical`, `pg_arrow_datafusion`), add a `.CLAUDE.md` file in that crate's root with crate-specific context: purpose, key types, internal conventions, and important invariants.
 
@@ -226,6 +227,9 @@ After completing any non-trivial task, consider: *"Did I learn something that wo
 
 > **Changelog** (newest first — this section is intentionally last for LLM context cache optimization):
 >
+> - 2026-02-12: Moved profiling/debugging content from CLAUDE.md to `docs/PROFILING_AND_DEBUGGING.md`
+>   (expanded with quick-start commands, pageinspect examples, flame graphs, comparative
+>   benchmarking, allocation counting). CLAUDE.md now has a one-line pointer in File Organization.
 > - 2026-02-12: Restructured for context cache optimization. Moved changelog to bottom (volatile
 >   content last, stable prefix first). Consolidated redundant sections (Notes merged into
 >   Development Principles, Testing Strategy + Running Tests + PostgreSQL Integration merged into
