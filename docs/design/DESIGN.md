@@ -1,9 +1,31 @@
 # Hybrid Dual-Engine Architecture: PostgreSQL + pg_arrow DataFusion
 
-> **Last updated**: 2026-02-06
+> **Last updated**: 2026-02-11
 >
 > **Changelog**:
 >
+> - 2026-02-12: Added "TPC-H Benchmarking" section (8-table join benchmark with schema,
+>   setup via tpchgen-rs, 22-query classification, partitioning strategy, performance profile).
+>   Added "CH-benCHmark (HTAP Benchmarking)" section for concurrent OLTP+OLAP testing
+>   (architecture diagram, BenchBase/go-tpc setup, freshness measurement, metrics).
+>   Updated implementation plan with TPC-H and CH-benCHmark checklist items.
+> - 2026-02-11: Added "Read Consistency for Direct Heap File Access" section. Documents the two
+>   fundamental consistency problems for direct heap file reads (shared buffer lag — committed data
+>   missing from disk, and cross-page inconsistency — pages at different LSNs) and the WAL replay
+>   solution: read `pd_lsn` from each page header, replay WAL records from `pd_lsn..target_lsn` to
+>   bring all pages to a single consistent point. Covers: single page atomicity (safe), target LSN
+>   selection (`pg_current_wal_flush_lsn()` / `pg_last_wal_replay_lsn()`), WAL record types for heap
+>   pages (RM_HEAP_ID, RM_HEAP2_ID), Full Page Image (FPI) optimization, complete read pipeline,
+>   Mode 2 advantage (paused replay = zero WAL replay needed), practical cost analysis, WAL parsing
+>   complexity (~2000-3000 lines), and consistency tiers (Tier 0: checkpoint-bound, Tier 1: MVCC-only,
+>   Tier 2: full WAL replay, Tier 3: paused replica). Added "WAL File Physical Format" section
+>   summarizing WAL file organization, LSN arithmetic, page/record headers, block references,
+>   FPI restoration, heap record types, scanning algorithm, continuation records, and version
+>   handling (PG14-master). Full 1900-line implementation reference at `RESEARCH/WAL_FORMAT.md`
+>   with Rust struct definitions, all constants, complete decoding algorithm, and version-specific
+>   code. Updated "File Access Patterns" section to reflect WAL replay requirement. Added
+>   limitation #15 (shared buffer lag). Updated Phase 2 with step 2d (WAL replay for Tier 2
+>   consistency, shared infrastructure with Phase 12b).
 > - 2026-02-06: Architectural clarity — pg_arrow has two storage layers behind a shared query
 >   engine. Storage Layer A (`pg_arrow_core`, Modes 1-2) reads PostgreSQL heap files. Storage
 >   Layer B (`pg_arrow_logical`, Mode 3) is an entirely new Arrow-native columnar database: base
@@ -74,6 +96,255 @@
 >   A deeper review of PostgreSQL's `heapam_visibility.c` revealed the full scope: hint bits, CLOG lookups,
 >   MultiXact resolution, subtransaction handling, snapshot `xip[]` arrays, and HOT chains.
 >   Updated the implementation plan and limitations accordingly.
+
+---
+
+## Table of Contents
+
+- [Architecture Overview](#architecture-overview)
+- [Key Benefits ✅](#key-benefits-)
+- [How It Works](#how-it-works)
+  - [1. PostgreSQL: Write Path (Unchanged)](#1-postgresql-write-path-unchanged)
+  - [2. pg_arrow: Read Path (DataFusion)](#2-pg_arrow-read-path-datafusion)
+  - [3. Coordination: WAL Monitoring](#3-coordination-wal-monitoring)
+- [Implementation Details](#implementation-details)
+  - [PostgreSQL Table Provider (Zero-Copy)](#postgresql-table-provider-zero-copy)
+- [Reading Strategy: When to Read Data Files](#reading-strategy-when-to-read-data-files)
+- [Connection Routing: Smart Client](#connection-routing-smart-client)
+- [Deployment Example](#deployment-example)
+  - [Configuration](#configuration)
+- [Failover Scenario](#failover-scenario)
+- [File Access Patterns](#file-access-patterns)
+  - [PostgreSQL (Read-Write)](#postgresql-read-write)
+  - [pg_arrow (Read-Only)](#pg_arrow-read-only)
+- [Read Consistency for Direct Heap File Access (Modes 1 & 2)](#read-consistency-for-direct-heap-file-access-modes-1--2)
+  - [The Two Consistency Problems](#the-two-consistency-problems)
+  - [Single Page Atomicity — Not the Real Problem](#single-page-atomicity--not-the-real-problem)
+  - [Why MVCC Alone Doesn't Fully Solve This](#why-mvcc-alone-doesnt-fully-solve-this)
+  - [The Solution: WAL Replay to Target LSN](#the-solution-wal-replay-to-target-lsn)
+  - [Choosing target_lsn](#choosing-target_lsn)
+  - [WAL Record Types for Heap Pages](#wal-record-types-for-heap-pages)
+  - [Full Page Images (FPI) — A Major Optimization](#full-page-images-fpi--a-major-optimization)
+  - [The Complete Read Pipeline](#the-complete-read-pipeline)
+  - [Mode 2 Advantage: Zero WAL Replay](#mode-2-advantage-zero-wal-replay)
+  - [Practical Cost of WAL Replay](#practical-cost-of-wal-replay)
+  - [WAL Parsing Complexity](#wal-parsing-complexity)
+  - [Consistency Tiers — Tradeoffs](#consistency-tiers--tradeoffs)
+- [MVCC Consistency](#mvcc-consistency)
+- [MVCC Visibility: The Real Complexity](#mvcc-visibility-the-real-complexity)
+  - [Tuple Header MVCC Fields](#tuple-header-mvcc-fields)
+  - [Infomask Bits Relevant to Visibility](#infomask-bits-relevant-to-visibility)
+  - [xmax Is Overloaded — It Does NOT Mean "Deleted"](#xmax-is-overloaded--it-does-not-mean-deleted)
+  - [What a Snapshot Really Is](#what-a-snapshot-really-is)
+  - [The Real Visibility Algorithm (HeapTupleSatisfiesMVCC)](#the-real-visibility-algorithm-heaptuplesatisfiesmvcc)
+  - [External File Dependencies](#external-file-dependencies)
+  - [Implications for pg_arrow](#implications-for-pg_arrow)
+  - [Practical Phased Approach for pg_arrow](#practical-phased-approach-for-pg_arrow)
+- [Performance Comparison](#performance-comparison)
+  - [Write Path (PostgreSQL Only)](#write-path-postgresql-only)
+  - [Read Path (Analytical Queries)](#read-path-analytical-queries)
+  - [Read Path (OLTP Queries)](#read-path-oltp-queries)
+- [Caching Strategy (Optional Optimization)](#caching-strategy-optional-optimization)
+- [Key Advantages of This Approach](#key-advantages-of-this-approach)
+- [PostgreSQL SQL Compatibility via DataFusion Extensions](#postgresql-sql-compatibility-via-datafusion-extensions)
+  - [DataFusion Extension Points](#datafusion-extension-points)
+  - [Already Supported by DataFusion (No Work Needed)](#already-supported-by-datafusion-no-work-needed)
+  - [Implementable via UDF/UDAF Registration (~50-200 lines each)](#implementable-via-udfudaf-registration-50-200-lines-each)
+  - [JSON Support via datafusion-functions-json](#json-support-via-datafusion-functions-json)
+  - [Capability-Based Query Routing](#capability-based-query-routing)
+  - [What Actually Requires PostgreSQL Fallback](#what-actually-requires-postgresql-fallback)
+- [Physical Storage Features](#physical-storage-features)
+  - [TOAST (The Oversized-Attribute Storage Technique) — CRITICAL](#toast-the-oversized-attribute-storage-technique--critical)
+  - [Visibility Map (`_vm` fork) — Major Optimization](#visibility-map-_vm-fork--major-optimization)
+  - [Free Space Map (`_fsm` fork) — Not Needed](#free-space-map-_fsm-fork--not-needed)
+  - [Tablespaces — Follow Symlinks](#tablespaces--follow-symlinks)
+  - [Unlogged Tables — No WAL](#unlogged-tables--no-wal)
+  - [Views and Materialized Views](#views-and-materialized-views)
+  - [Large Objects — Ignore](#large-objects--ignore)
+- [Partitioning — A Major Opportunity for pg_arrow](#partitioning--a-major-opportunity-for-pg_arrow)
+  - [Physical Layout](#physical-layout)
+  - [Partition Pruning](#partition-pruning)
+  - [Parallel Scan Across Partitions](#parallel-scan-across-partitions)
+  - [Table Inheritance (Legacy Partitioning)](#table-inheritance-legacy-partitioning)
+  - [Sharding — Out of Scope](#sharding--out-of-scope)
+- [PostgreSQL Protocol Compatibility](#postgresql-protocol-compatibility)
+  - [Wire Protocol Layers](#wire-protocol-layers)
+  - [Type OID Mapping](#type-oid-mapping)
+  - [Catalog and Session Queries](#catalog-and-session-queries)
+  - [Transaction Commands](#transaction-commands)
+  - [Error Protocol](#error-protocol)
+  - [Compatibility Tiers Summary](#compatibility-tiers-summary)
+- [Isolation Levels](#isolation-levels)
+  - [Why This Matters](#why-this-matters)
+  - [Per-Connection Snapshot Tracking](#per-connection-snapshot-tracking)
+  - [Snapshot Acquisition](#snapshot-acquisition)
+- [Security Model](#security-model)
+  - [What pg_arrow Bypasses](#what-pg_arrow-bypasses)
+  - [The RLS Problem — Example](#the-rls-problem--example)
+  - [Security Model Options](#security-model-options)
+  - [Recommended Approach](#recommended-approach)
+  - [Audit Logging](#audit-logging)
+- [Configuration and Cluster Validation](#configuration-and-cluster-validation)
+  - [pg_control — Read on Startup (CRITICAL)](#pg_control--read-on-startup-critical)
+  - [PostgreSQL Settings — Read via Connection](#postgresql-settings--read-via-connection)
+  - [Configuration File Structure](#configuration-file-structure)
+- [Segment Files](#segment-files)
+- [Torn Page Detection](#torn-page-detection)
+  - [Detection via Data Checksums](#detection-via-data-checksums)
+  - [Without Checksums](#without-checksums)
+  - [PostgreSQL's Full-Page Writes](#postgresqls-full-page-writes)
+- [WAL File Physical Format](#wal-file-physical-format)
+  - [WAL File Organization](#wal-file-organization)
+  - [LSN Arithmetic](#lsn-arithmetic)
+  - [WAL Page Header](#wal-page-header)
+  - [WAL Record Header (XLogRecord — 24 bytes)](#wal-record-header-xlogrecord--24-bytes)
+  - [Record Structure — Two-Phase Layout](#record-structure--two-phase-layout)
+  - [Block Reference Header](#block-reference-header)
+  - [Heap WAL Record Types (RM_HEAP_ID = 10, RM_HEAP2_ID = 9)](#heap-wal-record-types-rm_heap_id--10-rm_heap2_id--9)
+  - [Full Page Images (FPI)](#full-page-images-fpi)
+  - [Scanning WAL for a Specific Page](#scanning-wal-for-a-specific-page)
+  - [Continuation Records](#continuation-records)
+  - [WAL Parsing Complexity and Version Handling](#wal-parsing-complexity-and-version-handling)
+- [Database Encoding](#database-encoding)
+  - [Encoding Handling](#encoding-handling)
+  - [Collation](#collation)
+- [Concurrent DDL Safety](#concurrent-ddl-safety)
+  - [Detection Strategy](#detection-strategy)
+  - [Unix File Descriptor Semantics](#unix-file-descriptor-semantics)
+- [PostgreSQL Background Processes](#postgresql-background-processes)
+  - [Processes That Modify Data Files](#processes-that-modify-data-files)
+  - [Processes That Don't Modify Data Files](#processes-that-dont-modify-data-files)
+  - [autovacuum Is pg_arrow's Best Friend](#autovacuum-is-pg_arrows-best-friend)
+- [pg_arrow Background Jobs](#pg_arrow-background-jobs)
+  - [1. Cluster Health Monitor](#1-cluster-health-monitor)
+  - [2. WAL Position Monitor](#2-wal-position-monitor-already-in-design-doc-refined)
+  - [3. Schema Cache Manager](#3-schema-cache-manager)
+  - [4. Visibility Map Monitor](#4-visibility-map-monitor)
+  - [5. pg_arrow Statistics Collector](#5-pg_arrow-statistics-collector)
+  - [6. PostgreSQL Connection Pool](#6-postgresql-connection-pool)
+  - [7. Warm-Up / Pre-Fetch (Optional)](#7-warm-up--pre-fetch-optional)
+- [PostgreSQL Features — Considered and Excluded](#postgresql-features--considered-and-excluded)
+  - [Excluded: Not Relevant to Read-Only Analytics](#excluded-not-relevant-to-read-only-analytics)
+  - [Excluded: PostgreSQL Internal Subsystems](#excluded-postgresql-internal-subsystems)
+  - [Excluded: Storage Features Not Needed for Analytics](#excluded-storage-features-not-needed-for-analytics)
+  - [Partially Relevant: May Implement Later](#partially-relevant-may-implement-later)
+- [Library Architecture and Crate Structure](#library-architecture-and-crate-structure)
+  - [Layered Architecture](#layered-architecture)
+  - [Workspace Layout](#workspace-layout)
+  - [Core Library Public API](#core-library-public-api)
+  - [Consumer Integration Examples](#consumer-integration-examples)
+  - [Why This Separation Matters](#why-this-separation-matters)
+- [Arrow Flight and ADBC Protocol](#arrow-flight-and-adbc-protocol)
+  - [The Row Conversion Problem](#the-row-conversion-problem)
+  - [Dual-Protocol Architecture](#dual-protocol-architecture)
+  - [Arrow Flight SQL Server](#arrow-flight-sql-server)
+  - [pg_arrow_cli — psql-like for Arrow Flight SQL](#pg_arrow_cli--psql-like-for-arrow-flight-sql)
+  - [ADBC (Arrow Database Connectivity)](#adbc-arrow-database-connectivity)
+- [Arrow-Native Optimizations](#arrow-native-optimizations)
+  - [Late Materialization](#late-materialization)
+  - [Dictionary Encoding for Low-Cardinality Columns](#dictionary-encoding-for-low-cardinality-columns)
+  - [Vectorized SIMD Filtering](#vectorized-simd-filtering)
+  - [RecordBatch Size Tuning](#recordbatch-size-tuning)
+  - [Zero-Copy Slicing for LIMIT](#zero-copy-slicing-for-limit)
+- [PostgreSQL Index Reuse](#postgresql-index-reuse)
+  - [BRIN Index Reading — Best Bang for Buck](#brin-index-reading--best-bang-for-buck)
+  - [B-tree Index Reading — Targeted Row Lookup](#b-tree-index-reading--targeted-row-lookup)
+  - [Self-Built Zone Maps](#self-built-zone-maps)
+- [Incremental Arrow Page Cache](#incremental-arrow-page-cache)
+  - [Page-Level Arrow Cache](#page-level-arrow-cache)
+  - [Three-Level Invalidation (Cheapest First)](#three-level-invalidation-cheapest-first)
+  - [Column-Level Cache (Finer Granularity)](#column-level-cache-finer-granularity)
+  - [Background Pre-Conversion](#background-pre-conversion)
+  - [Persistent Cache (Survives Restarts)](#persistent-cache-survives-restarts)
+- [I/O Optimizations](#io-optimizations)
+  - [Memory-Mapped I/O](#memory-mapped-io)
+  - [io_uring Async I/O (Linux)](#io_uring-async-io-linux)
+  - [Readahead Hints](#readahead-hints)
+  - [Batched CLOG Lookups](#batched-clog-lookups)
+  - [Parallel Page Conversion](#parallel-page-conversion)
+  - [Pipeline: Read → Parse → Convert → Execute](#pipeline-read--parse--convert--execute)
+- [DataFusion Engine Integration](#datafusion-engine-integration)
+  - [Custom CatalogProvider (Upstreamable)](#custom-catalogprovider-upstreamable)
+  - [Statistics from pg_statistic (Upstreamable)](#statistics-from-pg_statistic-upstreamable)
+  - [Custom ExecutionPlan with Multi-Level Filtering](#custom-executionplan-with-multi-level-filtering)
+  - [Custom OptimizerRule: Adaptive Scan Strategy](#custom-optimizerrule-adaptive-scan-strategy)
+  - [Custom OptimizerRule: PostgreSQL Fallback](#custom-optimizerrule-postgresql-fallback)
+  - [Memory Pool Integration (DataFusion Core Change)](#memory-pool-integration-datafusion-core-change)
+  - [Optimization Stack Summary](#optimization-stack-summary)
+- [Deployment Modes and WAL Synchronization](#deployment-modes-and-wal-synchronization)
+  - [Three Deployment Modes](#three-deployment-modes)
+  - [Mode Comparison](#mode-comparison)
+  - [Mode 1: Sidecar + Primary — Details](#mode-1-sidecar--primary--details)
+  - [Mode 2: Sidecar + Promotable Replica — Details](#mode-2-sidecar--promotable-replica--details)
+  - [Mode 3: Logical Replica — Details](#mode-3-logical-replica--details)
+  - [WAL Synchronization Levels (Modes 1 & 2 only)](#wal-synchronization-levels-modes-1--2-only)
+  - [Alternative Architectures (Considered)](#alternative-architectures-considered)
+- [Production Readiness](#production-readiness)
+  - [Observability](#observability)
+  - [pg_arrow Configuration](#pg_arrow-configuration)
+  - [Graceful Lifecycle Management](#graceful-lifecycle-management)
+  - [Error Handling and Resilience](#error-handling-and-resilience)
+  - [Connection Management](#connection-management)
+  - [Collation Handling](#collation-handling)
+  - [Schema Evolution (ALTER TABLE Handling)](#schema-evolution-alter-table-handling)
+  - [Multi-Database Support](#multi-database-support)
+  - [Extension Type Handling](#extension-type-handling)
+  - [Numeric Precision Edge Cases](#numeric-precision-edge-cases)
+- [Testing and Validation Strategy](#testing-and-validation-strategy)
+  - [Fuzz Testing](#fuzz-testing)
+  - [Property-Based Testing](#property-based-testing)
+  - [Differential Testing Against PostgreSQL](#differential-testing-against-postgresql)
+  - [MVCC Visibility Validation](#mvcc-visibility-validation)
+  - [Test Data Generation](#test-data-generation)
+  - [Chaos / Fault Injection Testing](#chaos--fault-injection-testing)
+  - [Concurrency / Stress Testing](#concurrency--stress-testing)
+  - [Memory Safety: Miri and Sanitizers](#memory-safety-miri-and-sanitizers)
+  - [Snapshot Testing](#snapshot-testing)
+  - [Mutation Testing](#mutation-testing)
+  - [Cross-Version Compatibility Testing](#cross-version-compatibility-testing)
+  - [Code Coverage](#code-coverage)
+  - [Testing Matrix Summary](#testing-matrix-summary)
+- [ClickBench Benchmarking](#clickbench-benchmarking)
+  - [Setup](#setup)
+  - [Benchmark Harness](#benchmark-harness)
+  - [Benchmark Script](#benchmark-script)
+  - [What ClickBench Measures](#what-clickbench-measures)
+  - [Expected Performance Profile](#expected-performance-profile)
+  - [Comparison Targets](#comparison-targets)
+- [TPC-H Benchmarking](#tpc-h-benchmarking)
+  - [Schema Overview](#schema-overview)
+  - [Setup](#setup-1)
+  - [Query Classification](#query-classification)
+  - [What TPC-H Stresses in pg_arrow](#what-tpc-h-stresses-in-pg_arrow)
+  - [Benchmark Harness](#benchmark-harness-1)
+  - [Expected Performance Profile](#expected-performance-profile-1)
+  - [Comparison Targets](#comparison-targets-1)
+- [CH-benCHmark (HTAP Benchmarking)](#ch-benchmark-htap-benchmarking)
+  - [Architecture](#architecture)
+  - [Schema Mapping](#schema-mapping)
+  - [Setup](#setup-2)
+  - [Key Metrics](#key-metrics)
+  - [Freshness Measurement](#freshness-measurement)
+  - [Expected Performance Profile](#expected-performance-profile-2)
+  - [Other HTAP Benchmarks](#other-htap-benchmarks)
+- [Limitations](#limitations)
+- [Recommended Implementation Plan](#recommended-implementation-plan)
+  - [Phase 0: Cluster Validation and Foundation (1-2 weeks)](#phase-0-cluster-validation-and-foundation-1-2-weeks)
+  - [Phase 1: pg_arrow_core Library (4-6 weeks)](#phase-1-pg_arrow_core-library-4-6-weeks)
+  - [Phase 2: MVCC Consistency (4-6 weeks)](#phase-2-mvcc-consistency-4-6-weeks)
+  - [Phase 3: Wire Protocol (3-4 weeks)](#phase-3-wire-protocol-3-4-weeks)
+  - [Phase 4: Partitioning and Parallel Scan (2-3 weeks)](#phase-4-partitioning-and-parallel-scan-2-3-weeks)
+  - [Phase 5: PostgreSQL SQL Compatibility (2-3 weeks)](#phase-5-postgresql-sql-compatibility-2-3-weeks)
+  - [Phase 6: Production Features (3-4 weeks)](#phase-6-production-features-3-4-weeks)
+  - [Phase 7: Advanced Features and Optimizations (ongoing)](#phase-7-advanced-features-and-optimizations-ongoing)
+  - [Phase 8: Security (2-3 weeks)](#phase-8-security-2-3-weeks)
+  - [Phase 9: Arrow Flight SQL and pg_arrow_cli (3-4 weeks)](#phase-9-arrow-flight-sql-and-pg_arrow_cli-3-4-weeks)
+  - [Phase 10: Ecosystem Integrations (3-5 weeks)](#phase-10-ecosystem-integrations-3-5-weeks)
+  - [Phase 11: Testing Infrastructure (ongoing, parallel with all phases)](#phase-11-testing-infrastructure-ongoing-parallel-with-all-phases)
+  - [Phase 12: Deployment Modes and WAL Synchronization (5-8 weeks)](#phase-12-deployment-modes-and-wal-synchronization-5-8-weeks)
+  - [Phase 13: Production Readiness (3-4 weeks)](#phase-13-production-readiness-3-4-weeks)
+
+---
 
 ## Architecture Overview
 
@@ -590,16 +861,273 @@ File operations:
 
 ```rust
 // pg_arrow has read-only access
-// No locks needed (reads committed data)
+// No locks needed — but reads require WAL replay for consistency
 
 File operations:
-  - Read: heap files (on-demand)
+  - Read: heap files (on-demand, pages may be stale relative to shared buffers)
+  - Read: pg_wal/ files (WAL replay to bring stale pages up to target_lsn)
+  - Read: pg_xact/ files (CLOG for transaction commit/abort status)
   - NO writes to data files
-  - Monitor: WAL position (for cache invalidation)
-  - Safe: PostgreSQL's write locks protect concurrent access
+  - Monitor: WAL position (for cache invalidation and consistency target)
 ```
 
-**Safety**: PostgreSQL's write path ensures consistency. pg_arrow reads committed pages safely.
+**Important**: Naive heap file reads are NOT consistent — pages on disk lag behind shared
+buffers, and different pages are at different LSNs. WAL replay is required to bring all
+pages to a single consistent point in time. See "Read Consistency for Direct Heap File
+Access" below for the full solution.
+
+## Read Consistency for Direct Heap File Access (Modes 1 & 2)
+
+> **Context**: When pg_arrow reads PostgreSQL heap files directly from `$PGDATA/`, it faces
+> two fundamental consistency problems that naive file reads cannot solve. This section
+> documents the problems and the WAL replay solution required for correctness.
+
+### The Two Consistency Problems
+
+**Problem 1: Shared Buffer Lag — Committed Data Missing From Disk**
+
+PostgreSQL's write-ahead logging means data pages on disk are always behind the current
+state. A transaction commits by flushing WAL, not by flushing data pages. The bgwriter
+and checkpointer flush dirty pages asynchronously — potentially minutes after commit:
+
+```
+T0: INSERT INTO orders VALUES (1, 100.00);
+T1: COMMIT;
+    └─ WAL flushed to pg_wal/ (fsync)          ← committed, durable
+    └─ Data page: STILL IN SHARED BUFFERS ONLY  ← not on disk yet
+    └─ Heap file on disk: STALE
+
+T2: pg_arrow reads heap file
+    └─ Misses the committed row entirely
+
+T3: bgwriter eventually flushes page (minutes later)
+    └─ NOW the row is on disk
+```
+
+Reading heap files alone misses any committed data whose pages haven't been flushed by
+bgwriter or checkpointer. On a busy system this can be a significant fraction of recent data.
+
+**Problem 2: Cross-Page Inconsistency — Pages at Different Points in Time**
+
+When reading multiple pages of a table, each page is at a different LSN. Every page header
+contains `pd_lsn` — the LSN of the last WAL record applied to that page. Pages are flushed
+independently by bgwriter:
+
+```
+Reading 20 pages of a table at time T:
+
+Page 0:  pd_lsn = 0/5A000  ← flushed recently
+Page 5:  pd_lsn = 0/5F000  ← flushed very recently
+Page 10: pd_lsn = 0/52000  ← flushed a while ago
+Page 15: pd_lsn = 0/48000  ← not flushed since last checkpoint
+
+These pages represent 4 different points in time.
+A tuple's HOT chain could cross page boundaries at inconsistent states.
+VACUUM may have cleaned some pages but not others.
+```
+
+### Single Page Atomicity — Not the Real Problem
+
+A single 8KB aligned `pread()` is practically atomic on modern systems. PostgreSQL's
+bgwriter writes one aligned 8KB block at a time, and Linux's VFS page lock mechanism
+ensures an aligned read won't see a partially-written block during normal operation.
+Torn pages only occur during crashes (which is why `full_page_writes` exists for WAL
+recovery). So single-page reads are safe — the real problems are the two above.
+
+### Why MVCC Alone Doesn't Fully Solve This
+
+MVCC visibility (xmin/xmax + snapshot) gives logical consistency — each tuple is
+independently evaluated for visibility regardless of page state. This handles the
+cross-page inconsistency problem for data that is physically present on disk.
+
+But MVCC cannot make invisible data appear. If a committed INSERT's page hasn't been
+flushed to disk, that tuple simply doesn't exist in the heap file. No amount of MVCC
+checking can find a tuple that isn't physically there.
+
+### The Solution: WAL Replay to Target LSN
+
+WAL is guaranteed flushed to disk on commit (`synchronous_commit = on`, the default).
+Even when data pages are stale, the WAL contains everything needed to bring them current.
+Every page has `pd_lsn` in its header. The algorithm:
+
+```
+1. Choose target_lsn (a point where WAL is complete on disk)
+
+2. For each page needed:
+   a. Read page from heap file → get pd_lsn from header
+   b. If pd_lsn >= target_lsn → page is already current, use as-is
+   c. If pd_lsn < target_lsn → page is stale:
+      - Scan WAL from pd_lsn to target_lsn
+      - Find records tagged with this (relfilenode, fork, block_number)
+      - Apply them to the in-memory page copy
+      - Page is now at target_lsn
+
+3. All pages are now at the same target_lsn → cross-page consistent
+
+4. Apply MVCC visibility using snapshot → logically consistent result
+```
+
+This is the same mechanism as PostgreSQL's crash recovery and `pg_basebackup` — both
+replay WAL over potentially-inconsistent page states to achieve consistency.
+
+### Choosing target_lsn
+
+**With PostgreSQL connection (recommended)**:
+
+```sql
+SELECT pg_current_wal_flush_lsn();
+-- Returns the LSN up to which WAL is guaranteed flushed to pg_wal/ on disk
+-- All committed transactions before this LSN have their WAL records on disk
+```
+
+**On a replica (Mode 2)**:
+
+```sql
+SELECT pg_last_wal_replay_lsn();
+-- Returns the LSN up to which WAL has been replayed into data files
+-- With paused replay, ALL pages on disk are at this LSN — no WAL replay needed
+```
+
+**Fully offline (no PostgreSQL connection)**:
+
+Read the last complete WAL record from `pg_wal/` files directly. The end LSN of that
+record is a safe target_lsn.
+
+### WAL Record Types for Heap Pages
+
+WAL records are tagged with `(relfilenode, fork_number, block_number)`, so pg_arrow can
+find exactly which records affect which page:
+
+```
+Resource Manager: RM_HEAP_ID
+  XLOG_HEAP_INSERT      → tuple data + offset to insert at
+  XLOG_HEAP_DELETE      → item pointer offset to mark deleted
+  XLOG_HEAP_UPDATE      → old offset + new tuple data
+  XLOG_HEAP_HOT_UPDATE  → UPDATE within same page (no index update)
+  XLOG_HEAP_LOCK        → row lock (FOR UPDATE/SHARE) — modifies xmax/infomask
+  XLOG_HEAP_INIT_PAGE   → initialize a new page
+
+Resource Manager: RM_HEAP2_ID
+  XLOG_HEAP2_CLEAN         → vacuum page cleanup (remove dead line pointers)
+  XLOG_HEAP2_FREEZE_PAGE   → freeze old tuples (set XMIN_FROZEN)
+  XLOG_HEAP2_VISIBLE       → mark page all-visible in visibility map
+  XLOG_HEAP2_MULTI_INSERT  → multi-row INSERT (COPY)
+  XLOG_HEAP2_LOCK_UPDATED  → lock an already-updated tuple
+```
+
+### Full Page Images (FPI) — A Major Optimization
+
+When `full_page_writes = on` (default), the first modification to any page after a
+checkpoint writes the **entire 8KB page image** into the WAL record as a backup block:
+
+1. If pg_arrow finds an FPI in the WAL stream for a page, it can use the FPI as the
+   page content directly — no need to read the heap file for that page
+2. After a checkpoint, every modified page's first WAL record contains its FPI
+3. Subsequent WAL records for the same page (before next checkpoint) contain only deltas
+
+For the page cache (WAL Synchronization Level 2), pg_arrow can extract FPIs from the WAL
+stream and update its cache with zero file I/O.
+
+### The Complete Read Pipeline
+
+```
+Query arrives at pg_arrow (Mode 1 or 2):
+
+1. Acquire target_lsn
+   ├─ Mode 1 (primary):  SELECT pg_current_wal_flush_lsn()
+   └─ Mode 2 (replica):  SELECT pg_last_wal_replay_lsn()
+
+2. Acquire MVCC snapshot
+   └─ SELECT pg_current_snapshot()  →  'xmin:xmax:xip_list'
+
+3. For each page in the table:
+   a. pread() 8KB from heap file → raw page bytes
+   b. Parse page header → extract pd_lsn
+   c. If pd_lsn < target_lsn:
+      ├─ Scan WAL files for records matching (relfilenode, block_num)
+      │  in range pd_lsn..target_lsn
+      ├─ If FPI found → use FPI as page base, apply subsequent deltas
+      └─ Apply WAL records in LSN order to in-memory page copy
+   d. Page is now at target_lsn
+   e. For each tuple on page:
+      └─ Check MVCC visibility against snapshot (Phase 2 logic)
+   f. Visible tuples → convert to Arrow columnar format
+   g. Yield RecordBatch to DataFusion
+
+4. DataFusion executes query plan over RecordBatch stream
+
+5. Return results to client
+```
+
+### Mode 2 Advantage: Zero WAL Replay
+
+On a replica with paused WAL replay, all pages on disk are guaranteed consistent at the
+replay LSN. No concurrent writes are modifying pages. This eliminates the WAL replay step
+entirely:
+
+```sql
+-- On replica:
+SELECT pg_wal_replay_pause();
+-- No bgwriter, no recovery process modifying pages
+-- All pages on disk are at pg_last_wal_replay_lsn()
+-- pg_arrow reads heap files — perfectly consistent, no WAL replay needed
+SELECT pg_wal_replay_resume();
+```
+
+This is why Mode 2 (sidecar + replica) is the recommended production deployment for heap
+file reading. The tradeoff is briefly pausing replay, which increases replication lag by
+the duration of the scan.
+
+### Practical Cost of WAL Replay
+
+| Scenario | WAL to replay per page | Notes |
+|---|---|---|
+| Right after `CHECKPOINT` | Minimal (0-few records) | Pages recently flushed, pd_lsn close to target |
+| Long after `CHECKPOINT` (~5 min) | More records per page | Pages may be `checkpoint_timeout` behind |
+| Mode 2 with paused replay | **Zero** | All pages already at replay LSN |
+| Hot table with frequent updates | More records per page | But also more likely in OS page cache |
+
+**Optimization**: Issue `CHECKPOINT` before a large scan to force-flush all dirty buffers.
+After checkpoint completes, most pages have pd_lsn close to current, minimizing WAL replay.
+This adds checkpoint overhead (~seconds) but makes the scan itself faster.
+
+### WAL Parsing Complexity
+
+WAL record format is PostgreSQL-version-specific and not a stable API. Implementing a
+WAL parser requires:
+
+| Component | Description | Approximate size |
+|---|---|---|
+| WAL page headers | `XLogPageHeaderData`, `XLogLongPageHeaderData` | ~100 lines |
+| Record headers | `XLogRecord` (24 bytes: total_length, xid, rmgr_id) | ~200 lines |
+| Resource manager dispatch | Route by rmgr_id to heap/heap2/etc. handlers | ~300 lines |
+| Heap record parsing | `xl_heap_insert`, `xl_heap_delete`, `xl_heap_update` | ~500 lines |
+| Backup block (FPI) extraction | `XLogRecordBlockHeader`, compressed/uncompressed FPI | ~400 lines |
+| Version-aware handling | Layout differences between PG major versions | ~500 lines |
+| **Total** | | **~2000-3000 lines** |
+
+PostgreSQL's `pg_waldump` source (`src/bin/pg_waldump/`) is the reference implementation.
+
+**Phase dependency**: WAL replay for read consistency (Phase 2) shares parsing
+infrastructure with WAL stream parsing for cache invalidation (Phase 12b). The record
+parser is the same code; the difference is whether records are applied to in-memory pages
+(consistency) or used to invalidate/update cache entries (optimization).
+
+### Consistency Tiers — Tradeoffs
+
+pg_arrow can operate at different consistency levels depending on deployment needs:
+
+| Tier | Consistency | WAL replay needed | Requirements |
+|---|---|---|---|
+| **Tier 0: Checkpoint-bound reads** | Pages consistent up to last checkpoint only | None | Read `pg_control` for checkpoint LSN |
+| **Tier 1: MVCC-only (no WAL replay)** | Logically correct for data on disk, but misses unflushed committed data | None | Snapshot via `pg_current_snapshot()` |
+| **Tier 2: WAL replay to flush LSN** | Fully consistent including unflushed data | Yes | WAL parser + `pg_current_wal_flush_lsn()` |
+| **Tier 3: Paused replica reads** | Fully consistent, zero WAL replay cost | None | Mode 2 replica + `pg_wal_replay_pause()` |
+
+Phase 1 can start with Tier 1 (MVCC-only) — this is correct for data on disk but may
+miss very recently committed rows whose pages haven't been flushed. For most analytical
+workloads (where data freshness of seconds-to-minutes is acceptable), this is sufficient.
+Tier 2 (full WAL replay) is the complete solution, implemented alongside Phase 12b.
 
 ## MVCC Consistency
 
@@ -1866,6 +2394,239 @@ If checksums are disabled, pg_arrow has no reliable torn page detection. Options
 PostgreSQL's `full_page_writes = on` (default) writes complete page images to WAL after each
 checkpoint. This protects PostgreSQL from torn pages during recovery, but does NOT protect
 external readers like pg_arrow — it only helps if you replay WAL.
+
+## WAL File Physical Format
+
+> **Context**: pg_arrow needs a WAL parser for read consistency (replaying WAL records onto stale
+> heap pages) and cache invalidation (knowing which pages changed). This section summarizes the
+> key binary structures. Full implementation-ready reference with exact byte offsets, Rust struct
+> definitions, and decoding algorithms is in `RESEARCH/WAL_FORMAT.md` (~1900 lines).
+
+### WAL File Organization
+
+WAL files live in `$PGDATA/pg_wal/`. Each file is a "segment" — default 16MB, containing
+2048 pages of 8KB each. Segment filenames are 24 hex characters encoding
+`(TimeLineID, log_id, seg_id)`.
+
+```
+$PGDATA/pg_wal/
+  000000010000000000000001   ← segment 1, timeline 1 (16MB)
+  000000010000000000000002   ← segment 2
+  ...
+
+Segment internals (16MB):
+  Page 0:    [LongPageHeader 40B]  [record data...]
+  Page 1:    [ShortPageHeader 24B] [record data...]
+  ...
+  Page 2047: [ShortPageHeader 24B] [record data...]
+```
+
+### LSN Arithmetic
+
+An LSN (`XLogRecPtr = uint64`) is a byte offset into the abstract WAL stream:
+
+```rust
+// LSN → segment file + offset
+let segment_number = lsn / wal_segment_size;   // default wal_segment_size = 16MB
+let segment_offset = lsn & (wal_segment_size - 1);
+let page_number    = segment_offset / 8192;    // XLOG_BLCKSZ
+let page_offset    = segment_offset % 8192;
+
+// LSN → segment filename
+let segments_per_xlog_id = 0x100000000u64 / wal_segment_size;
+let log_id  = (segment_number / segments_per_xlog_id) as u32;
+let seg_id  = (segment_number % segments_per_xlog_id) as u32;
+let filename = format!("{:08X}{:08X}{:08X}", timeline_id, log_id, seg_id);
+
+// Advance past a record
+let next_lsn = lsn + maxalign(xl_tot_len);  // MAXALIGN = round up to 8
+```
+
+### WAL Page Header
+
+Every 8KB WAL page starts with a header. First page per segment = long header (40B),
+all others = short header (24B):
+
+```
+XLogPageHeaderData (short — 24 bytes):
+  Offset  Size  Field         Description
+   0       2    xlp_magic     Version indicator (e.g., 0xD118 = PG18)
+   2       2    xlp_info      Flags (XLP_LONG_HEADER, XLP_FIRST_IS_CONTRECORD, ...)
+   4       4    xlp_tli       TimeLineID
+   8       8    xlp_pageaddr  LSN of this page's start
+  16       4    xlp_rem_len   Remaining bytes from previous page's record
+  (MAXALIGN to 24 bytes)
+
+XLogLongPageHeaderData (long — extends short with):
+  20       8    xlp_sysid     System identifier (from pg_control)
+  28       4    xlp_seg_size  WAL segment size (cross-check)
+  32       4    xlp_xlog_blcksz  WAL block size (cross-check, = 8192)
+  (MAXALIGN to 40 bytes)
+```
+
+**XLOG_PAGE_MAGIC version detection**:
+
+| PG Version | Magic  | Key change |
+|------------|--------|------------|
+| PG 14      | 0xD110 | Baseline |
+| PG 15      | 0xD113 | LZ4/ZSTD FPI compression |
+| PG 16      | 0xD114 | RelFileNode → RelFileLocator (same binary layout) |
+| PG 17      | 0xD116 | Unified prune/freeze WAL records |
+| PG 18      | 0xD118 | xl_heap_prune: uint8 reason + uint8 flags |
+| PG master  | 0xD11A | xl_heap_prune flags → uint16, VM bits in prune |
+
+### WAL Record Header (XLogRecord — 24 bytes)
+
+```
+Offset  Size  Field       Description
+ 0       4    xl_tot_len  Total length of entire record (header + all data)
+ 4       4    xl_xid      Transaction ID
+ 8       8    xl_prev     LSN of previous record
+16       1    xl_info     Low 4 bits: internal flags; High 4 bits: rmgr-specific opcode
+17       1    xl_rmid     Resource manager ID (10 = RM_HEAP_ID, 9 = RM_HEAP2_ID)
+18       2    (padding)
+20       4    xl_crc      CRC-32C of entire record
+```
+
+### Record Structure — Two-Phase Layout
+
+After the 24-byte header, a WAL record has **headers first, then data**:
+
+```
+[XLogRecord — 24 bytes]
+[Block Reference Headers]     ← parsed first to learn sizes and targets
+  [BlockHeader 0: 4B base + optional FPI header + RelFileLocator + BlockNumber]
+  [BlockHeader 1: ...]
+  ...
+[Main Data Header]            ← XLogRecordDataHeaderShort (2B) or Long (5B)
+[Block 0 FPI data]            ← full-page image bytes (if present)
+[Block 0 block data]          ← rmgr-specific per-block payload
+[Block 1 FPI data]
+[Block 1 block data]
+...
+[Main data]                   ← rmgr-specific main record payload
+```
+
+**Key insight**: Headers and data are separated. Parse all headers first to learn sizes,
+then read data payloads. Fields within headers are NOT aligned — use byte-slice parsing
+(`from_ne_bytes`), not pointer casts.
+
+### Block Reference Header
+
+Each block reference identifies `(RelFileLocator, ForkNumber, BlockNumber)`:
+
+```
+Base header (4 bytes):
+  0: uint8  block_id     (0-32)
+  1: uint8  fork_flags   (low 4: fork, high 4: HAS_IMAGE|HAS_DATA|WILL_INIT|SAME_REL)
+  2: uint16 data_length  (per-block payload size)
+
+Conditional extensions:
+  IF HAS_IMAGE:  +5B XLogRecordBlockImageHeader (bimg_len, hole_offset, bimg_info)
+    IF compressed AND has_hole: +2B XLogRecordBlockCompressHeader (hole_length)
+  IF NOT SAME_REL: +12B RelFileLocator (spcOid, dbOid, relNumber)
+  ALWAYS: +4B BlockNumber
+```
+
+### Heap WAL Record Types (RM_HEAP_ID = 10, RM_HEAP2_ID = 9)
+
+The opcode is `xl_info & 0x70`. Bit 7 (`0x80`) = page re-initialized.
+
+| rmgr | Opcode | xl_info & 0x70 | Main data struct | Size | pg_arrow relevance |
+|------|--------|---------------|-----------------|------|-------------------|
+| HEAP | INSERT | 0x00 | `xl_heap_insert` | 3B | Critical — new rows |
+| HEAP | DELETE | 0x10 | `xl_heap_delete` | 8B | Critical — row removal |
+| HEAP | UPDATE | 0x20 | `xl_heap_update` | 14B | Critical — modified rows |
+| HEAP | HOT_UPDATE | 0x40 | `xl_heap_update` | 14B | Critical — same-page update |
+| HEAP | LOCK | 0x60 | `xl_heap_lock` | 8B | Needed — modifies xmax/infomask |
+| HEAP | CONFIRM | 0x50 | `xl_heap_confirm` | 2B | Rare — speculative inserts |
+| HEAP | INPLACE | 0x70 | variable | var | System catalogs only |
+| HEAP2 | MULTI_INSERT | 0x50 | `xl_heap_multi_insert` | 3B+ | Critical — COPY operations |
+| HEAP2 | PRUNE_* | 0x10/20/30 | `xl_heap_prune` | 2B+ | Important — vacuum cleanup |
+| HEAP2 | VISIBLE | 0x40 | `xl_heap_visible` | 5B | VM optimization |
+
+### Full Page Images (FPI)
+
+When `full_page_writes = on` (default), the first modification to a page after a checkpoint
+writes the entire 8KB page image into WAL. The image has the "hole" (zero-filled gap between
+line pointers and tuple data) removed to save space. PG15+ supports LZ4/ZSTD compression.
+
+**For pg_arrow**: When an FPI is found for a target page, use it directly as the page content.
+All prior WAL records for that page become irrelevant — the FPI is a complete snapshot.
+
+```
+FPI restoration:
+  1. Read bimg_len bytes from WAL data portion
+  2. If compressed → decompress (pglz, lz4, or zstd based on bimg_info flags)
+  3. Restore hole: copy bytes before hole_offset, leave hole_length zeros, copy bytes after
+  4. Result: complete 8KB page
+```
+
+### Scanning WAL for a Specific Page
+
+WAL has no index by `(relfilelocator, blkno)` — must scan linearly:
+
+```
+ScanWalForPage(target_rel, target_fork, target_blkno, start_lsn, end_lsn):
+  FOR each record R where start_lsn <= R.lsn < end_lsn:
+    Skip if R.xl_rmid not in {RM_HEAP_ID, RM_HEAP2_ID}  ← fast pre-filter
+    Decode block reference headers
+    FOR each block ref B:
+      IF B.rlocator == target_rel AND B.forknum == target_fork AND B.blkno == target_blkno:
+        IF B.has_image → DISCARD all prior records, COLLECT as FPI
+        ELSE → COLLECT as delta record
+  RETURN collected records in LSN order
+```
+
+**Performance mitigations**: Pre-filter by rmgr ID (skip non-heap records by jumping
+`xl_tot_len`), batch-scan for multiple target pages in one pass, FPI short-circuit
+(discard prior records when FPI found), checkpoint awareness (page `pd_lsn` tells you
+exactly where to start scanning).
+
+### Continuation Records
+
+Records larger than remaining page space span multiple pages. The next page has
+`XLP_FIRST_IS_CONTRECORD` set and `xlp_rem_len` indicates remaining bytes. Must
+reassemble the record from multiple pages before decoding.
+
+### WAL Parsing Complexity and Version Handling
+
+WAL format changes between major PostgreSQL versions. Detect version from `xlp_magic` in
+the first page header. There are only **two real breaking changes**:
+
+**Breaking Change 1 — FPI Compression (PG15+)**: PG14 only supports `pglz`. PG15 added
+LZ4 (`bimg_info & 0x08`) and ZSTD (`bimg_info & 0x10`). Only matters if cluster has
+`wal_compression = lz4|zstd` (not default).
+
+**Breaking Change 2 — HEAP2 Opcode Shift (PG17+)**: PG17 unified vacuum/freeze into
+`PRUNE_*` records and **shifted all HEAP2 opcodes from VISIBLE onwards down by 0x10**:
+
+```
+Opcode    PG14-16           PG17+
+0x30      CLEAN             PRUNE_VACUUM_CLEANUP
+0x40      FREEZE_PAGE       VISIBLE              ← was 0x50
+0x50      VISIBLE           MULTI_INSERT         ← was 0x60
+0x60      MULTI_INSERT      LOCK_UPDATED         ← was 0x70
+0x70      LOCK_UPDATED      NEW_CID              ← was 0x80
+0x80      NEW_CID           (unused)
+```
+
+A parser hardcoding PG14-16 opcodes will misinterpret every VISIBLE, MULTI_INSERT,
+LOCK_UPDATED, and NEW_CID record on PG17+.
+
+**What's stable across ALL versions**: XLogRecord header (24B), page headers, block
+reference headers, RelFileLocator (12B), INSERT/DELETE/UPDATE/HOT_UPDATE/LOCK opcodes
+and payload structs, LSN arithmetic, CRC-32C, continuation records.
+
+**Recommended strategy**: Start with PG17/18 support (simpler unified prune/freeze,
+avoids PG14-16 vacuum/freeze structs). Use Neon project's `postgres_ffi` crate as
+reference for version-specific struct definitions. Implement the minimal record set
+(INSERT, DELETE, UPDATE, HOT_UPDATE, MULTI_INSERT, FPI) and add LOCK, PRUNE, VISIBLE
+as needed. Validate output against `pg_waldump`.
+
+> **Full reference**: See `RESEARCH/WAL_FORMAT.md` for complete Rust struct definitions,
+> all constants, the full decoding algorithm, version-specific handling code, and the
+> FPI restoration implementation.
 
 ## Database Encoding
 
@@ -3936,6 +4697,7 @@ fn decode_tuple(tuple: &HeapTuple, schema: &[PgAttribute]) -> Result<Vec<Datum>>
 ```
 
 Key considerations:
+
 - `pg_attribute.attisdropped = true` → column was dropped, slot is a placeholder (always NULL)
 - `pg_attribute.atthasmissing = true` + `pg_attribute.attmissingval` → default value for
   tuples that predate `ADD COLUMN` (PostgreSQL 11+)
@@ -4804,6 +5566,8 @@ cargo tarpaulin --out Html --output-dir coverage/
 | Cross-version | Multi-PG setup | Version-specific regressions | Every commit |
 | Coverage | `tarpaulin` | Untested code paths | Weekly |
 | ClickBench | Benchmark harness | Performance regressions | Pre-release |
+| TPC-H | Benchmark harness | Join performance regressions, multi-table correctness | Pre-release |
+| CH-benCHmark | BenchBase/go-tpc | HTAP throughput, freshness lag regressions | Pre-release |
 
 ## ClickBench Benchmarking
 
@@ -4977,6 +5741,471 @@ For context, include these systems in benchmark reports:
 | DuckDB (from Parquet) | Analytics engine reference | ClickBench public results |
 | ClickHouse | Specialized OLAP reference | ClickBench public results |
 
+## TPC-H Benchmarking
+
+[TPC-H](http://www.tpc.org/tpch/) is an 8-table decision-support benchmark with 22 join-heavy
+analytical queries. It complements ClickBench — where ClickBench tests single-table scan
+throughput (wide table, simple filters, aggregations), TPC-H tests **multi-table join
+performance** across a normalized snowflake schema. This is critical for pg_arrow because most
+real-world analytical queries join multiple tables, and each table is a separate heap file that
+pg_arrow must read, convert to Arrow, and feed into DataFusion's join operators. TPC-H becomes
+relevant at **Phase 4+** (after basic query execution, joins, and partitioning support).
+
+### Schema Overview
+
+TPC-H uses a snowflake schema centered on LINEITEM and ORDERS:
+
+```
+                              ┌──────────┐
+                              │  REGION  │
+                              │  5 rows  │
+                              └────┬─────┘
+                                   │ r_regionkey
+                              ┌────┴─────┐
+                              │  NATION  │
+                              │  25 rows │
+                              └──┬───┬───┘
+                  n_nationkey ┌──┘   └──┐ n_nationkey
+                         ┌────┴────┐ ┌──┴──────┐
+                         │ SUPPLIER│ │ CUSTOMER│
+                         │ 10K(SF1)│ │ 150K    │
+                         └────┬────┘ └────┬────┘
+                   s_suppkey  │    c_custkey│
+              ┌───────────────┤            │
+              │          ┌────┴────┐  ┌────┴────┐
+              │          │ PARTSUPP│  │  ORDERS │
+              │          │  800K   │  │  1.5M   │
+              │          └────┬────┘  └────┬────┘
+              │     ps_partkey│   o_orderkey│
+         ┌────┴────┐         │        ┌────┴─────┐
+         │  PART   │         │        │ LINEITEM │
+         │  200K   │         │        │  6M(SF1) │
+         └─────────┘         │        └──────────┘
+                             │             │
+                             └─────────────┘
+                           l_partkey, l_suppkey
+```
+
+| Table | Rows (SF1) | Rows (SF10) | Rows (SF100) | Role |
+|---|---|---|---|---|
+| LINEITEM | 6,001,215 | 59,986,052 | 600,037,902 | Fact table (~75% of total data) |
+| ORDERS | 1,500,000 | 15,000,000 | 150,000,000 | Order headers |
+| PARTSUPP | 800,000 | 8,000,000 | 80,000,000 | Part-supplier junction |
+| CUSTOMER | 150,000 | 1,500,000 | 15,000,000 | Customer dimension |
+| PART | 200,000 | 2,000,000 | 20,000,000 | Part dimension |
+| SUPPLIER | 10,000 | 100,000 | 1,000,000 | Supplier dimension |
+| NATION | 25 | 25 | 25 | Nation reference |
+| REGION | 5 | 5 | 5 | Region reference |
+
+At SF10 (~10GB raw data, ~25GB in PostgreSQL heap files), LINEITEM alone is ~18GB — large
+enough to stress pg_arrow's page reading pipeline while fitting in memory for warm-cache tests.
+
+### Setup
+
+```bash
+# === Option A: tpchgen-rs (recommended — pure Rust, 20x faster than dbgen) ===
+# Built by the DataFusion community, outputs CSV/Parquet directly
+cargo install tpchgen-rs
+tpchgen -s 10 --format csv --output tpch-data/
+# Generates: customer.csv, lineitem.csv, nation.csv, orders.csv,
+#            part.csv, partsupp.csv, region.csv, supplier.csv
+
+# === Option B: DuckDB tpch extension (quick, good for validation) ===
+duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=10);"
+duckdb -c "COPY lineitem TO 'tpch-data/lineitem.csv' (FORMAT CSV);"
+# ... repeat for other tables
+
+# === Option C: Classic dbgen (original TPC-H tool) ===
+git clone https://github.com/electrum/tpch-dbgen.git && cd tpch-dbgen
+make && ./dbgen -s 10
+
+# --- Load into PostgreSQL ---
+# 1. Create database and schema
+createdb tpch
+psql -d tpch -f tpch-schema.sql   # DDL from TPC-H spec (CREATE TABLE statements)
+
+# 2. Load each table
+for table in region nation part supplier partsupp customer orders lineitem; do
+    psql -d tpch -c "\\COPY $table FROM 'tpch-data/${table}.csv' WITH (FORMAT csv, DELIMITER '|')"
+done
+
+# 3. Create indexes (for PostgreSQL baseline comparison)
+psql -d tpch -f tpch-indexes.sql  # Primary keys + foreign keys from spec
+
+# 4. VACUUM FREEZE — critical for pg_arrow all-frozen page optimization
+psql -d tpch -c "VACUUM (FREEZE, ANALYZE)"
+
+# 5. Optional: Partition LINEITEM by l_shipdate (7 yearly partitions, 1992-1998)
+#    This tests pg_arrow's partition pruning on date-range queries
+psql -d tpch <<'SQL'
+CREATE TABLE lineitem_partitioned (LIKE lineitem INCLUDING ALL)
+    PARTITION BY RANGE (l_shipdate);
+CREATE TABLE lineitem_y1992 PARTITION OF lineitem_partitioned
+    FOR VALUES FROM ('1992-01-01') TO ('1993-01-01');
+CREATE TABLE lineitem_y1993 PARTITION OF lineitem_partitioned
+    FOR VALUES FROM ('1993-01-01') TO ('1994-01-01');
+CREATE TABLE lineitem_y1994 PARTITION OF lineitem_partitioned
+    FOR VALUES FROM ('1994-01-01') TO ('1995-01-01');
+CREATE TABLE lineitem_y1995 PARTITION OF lineitem_partitioned
+    FOR VALUES FROM ('1995-01-01') TO ('1996-01-01');
+CREATE TABLE lineitem_y1996 PARTITION OF lineitem_partitioned
+    FOR VALUES FROM ('1996-01-01') TO ('1997-01-01');
+CREATE TABLE lineitem_y1997 PARTITION OF lineitem_partitioned
+    FOR VALUES FROM ('1997-01-01') TO ('1998-01-01');
+CREATE TABLE lineitem_y1998 PARTITION OF lineitem_partitioned
+    FOR VALUES FROM ('1998-01-01') TO ('1999-01-01');
+INSERT INTO lineitem_partitioned SELECT * FROM lineitem;
+VACUUM (FREEZE, ANALYZE) lineitem_partitioned;
+SQL
+```
+
+### Query Classification
+
+All 22 TPC-H queries, classified by SQL features and what they stress in pg_arrow:
+
+| Q# | Name | Tables Joined | Key SQL Features | pg_arrow Stress Point |
+|---|---|---|---|---|
+| Q1 | Pricing Summary | 1 (LINEITEM) | Filtered agg, GROUP BY | LINEITEM scan throughput, date filter pushdown |
+| Q2 | Minimum Cost Supplier | 5 | Correlated subquery, min agg | Multi-table join, subquery planning |
+| Q3 | Shipping Priority | 3 | 3-way join, date filter, top-N | Join ordering, date pushdown, LIMIT |
+| Q4 | Order Priority Checking | 2 | EXISTS subquery, date range | Semi-join optimization |
+| Q5 | Local Supplier Volume | 6 | 6-way join, date filter | Join pipeline depth, filter pushdown |
+| Q6 | Forecasting Revenue | 1 (LINEITEM) | Range predicates, agg | Pure scan + filter — best-case for pg_arrow |
+| Q7 | Volume Shipping | 6 | CASE, 2 nation filters | Cross-join with selective filters |
+| Q8 | National Market Share | 8 (all!) | 8-way join, CASE agg | Maximum join complexity, all heap files active |
+| Q9 | Product Type Profit | 6 | LIKE, multi-agg | String predicate pushdown, TOAST potential |
+| Q10 | Returned Item Reporting | 4 | Date range, top-N | Join + sort + limit pipeline |
+| Q11 | Important Stock ID | 3 | HAVING, subquery for threshold | Aggregation with threshold filter |
+| Q12 | Shipping Modes | 2 | IN list, CASE, date range | Predicate variety, CASE in aggregation |
+| Q13 | Customer Distribution | 2 | LEFT OUTER JOIN, subquery | Outer join handling |
+| Q14 | Promotion Effect | 2 | CASE in agg, date filter | Conditional aggregation |
+| Q15 | Top Supplier | 3 | View/CTE, max subquery | CTE materialization |
+| Q16 | Parts/Supplier Relationship | 3 | NOT IN, NOT LIKE, DISTINCT | Anti-join, string filtering |
+| Q17 | Small-Quantity Order | 3 | Correlated subquery, avg | Correlated subquery execution |
+| Q18 | Large Volume Customer | 3 | HAVING on subquery, top-N | Subquery in HAVING, large result sort |
+| Q19 | Discounted Revenue | 3 | OR of AND predicates | Complex predicate composition |
+| Q20 | Potential Part Promotion | 4 | Nested subqueries, IN | Multi-level subquery |
+| Q21 | Suppliers Who Kept Orders | 4 | EXISTS + NOT EXISTS | Anti-semi-join combination |
+| Q22 | Global Sales Opportunity | 2 | Substring, NOT EXISTS, avg | String functions, anti-join |
+
+### What TPC-H Stresses in pg_arrow
+
+**Cross-table joins (2-8 tables per query).** Every query except Q1 and Q6 joins multiple
+tables. Q8 joins all 8 tables. Each table is a separate PostgreSQL heap file → separate
+`TableProvider` in DataFusion. This tests pg_arrow's ability to maintain multiple concurrent
+page readers and feed Arrow batches into DataFusion's hash join / merge join operators.
+
+**LINEITEM scan throughput.** LINEITEM is ~75% of total data. At SF10, that's ~60M rows across
+~18GB of heap pages. Q1 and Q6 are pure LINEITEM scans — they isolate pg_arrow's raw page
+reading and Arrow conversion speed without join overhead.
+
+**Date range filter pushdown.** 15 of 22 queries filter on `l_shipdate` or `o_orderdate`. These
+are fixed-width `date` columns (4 bytes, no TOAST) — ideal candidates for predicate pushdown
+into the page reader. With partitioned LINEITEM, this also tests partition pruning (skip entire
+partition heap files when the date range doesn't overlap).
+
+**TOAST on comment columns at high scale factors.** LINEITEM has `l_comment` (VARCHAR(44)),
+ORDERS has `o_comment` (VARCHAR(79)), CUSTOMER has `c_comment` (VARCHAR(117)). At SF1 these
+are inline, but at SF100+ longer comments may trigger TOAST. This validates that pg_arrow's
+TOAST detoasting works correctly under join workloads.
+
+**Cross-table MVCC snapshot consistency.** When reading 8 separate heap files for Q8, all must
+reflect the same transaction snapshot. A row visible in LINEITEM but invisible in ORDERS (due
+to snapshot mismatch) would produce wrong join results — a correctness-critical test.
+
+**Partition pruning on date-partitioned LINEITEM.** With yearly partitions (1992-1998), a query
+filtering `l_shipdate BETWEEN '1995-01-01' AND '1996-12-31'` should only read 2 of 7 partition
+heap files. This tests pg_arrow's integration with DataFusion's partition pruning logic.
+
+### Benchmark Harness
+
+```rust
+// benches/tpch.rs
+use std::time::Instant;
+
+struct TpchResult {
+    query_id: usize,       // 1-22
+    query_name: String,
+    tables_joined: usize,
+    pg_direct_ms: f64,
+    pg_arrow_cold_ms: f64, // First run, no Arrow cache
+    pg_arrow_warm_ms: f64, // Subsequent run, cached Arrow batches
+    speedup_cold: f64,
+    speedup_warm: f64,
+    results_match: bool,   // Row-by-row diff vs PostgreSQL
+}
+
+fn run_tpch_benchmark(sf: u32) -> Vec<TpchResult> {
+    let queries = load_tpch_queries("tpch/queries/"); // Q1.sql .. Q22.sql
+    let mut results = Vec::new();
+
+    for (i, query) in queries.iter().enumerate() {
+        // Clear pg_arrow cache for cold measurement
+        arrow_conn.query("SELECT pg_arrow_drop_cache()", &[]).ok();
+
+        // Cold run (single)
+        let cold_start = Instant::now();
+        arrow_conn.query(query, &[]).unwrap();
+        let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Warm runs (3x median)
+        let warm_times: Vec<f64> = (0..3).map(|_| {
+            let start = Instant::now();
+            arrow_conn.query(query, &[]).unwrap();
+            start.elapsed().as_secs_f64() * 1000.0
+        }).collect();
+
+        // PostgreSQL baseline (3x median, already cached in shared buffers)
+        let pg_times: Vec<f64> = (0..3).map(|_| {
+            let start = Instant::now();
+            pg_conn.query(query, &[]).unwrap();
+            start.elapsed().as_secs_f64() * 1000.0
+        }).collect();
+
+        let pg_ms = median(&pg_times);
+        results.push(TpchResult {
+            query_id: i + 1,
+            query_name: tpch_query_name(i + 1),
+            tables_joined: tpch_table_count(i + 1),
+            pg_direct_ms: pg_ms,
+            pg_arrow_cold_ms: cold_ms,
+            pg_arrow_warm_ms: median(&warm_times),
+            speedup_cold: pg_ms / cold_ms,
+            speedup_warm: pg_ms / median(&warm_times),
+            results_match: diff_query_results(query, &pg_conn, &arrow_conn),
+        });
+    }
+    results
+}
+```
+
+### Expected Performance Profile
+
+```
+┌─────────────────────────┬──────────┬──────────┬──────────────────────────────────────┐
+│ Query Category          │ Cold     │ Warm     │ Why                                  │
+├─────────────────────────┼──────────┼──────────┼──────────────────────────────────────┤
+│ Single-table scan       │ 1-2x    │ 3-8x    │ Q1/Q6: LINEITEM only — same as       │
+│ (Q1, Q6)               │ faster   │ faster   │ ClickBench pattern                   │
+│ 2-3 table join          │ 0.5-1.5x│ 2-5x    │ Q3/Q4/Q10/Q12: join overhead vs      │
+│ (Q3, Q4, Q10, Q12)     │          │ faster   │ PG's optimized nested loop           │
+│ 4-6 table join          │ 0.5-1x  │ 1.5-4x  │ Q5/Q7/Q9: DataFusion hash joins      │
+│ (Q5, Q7, Q9)           │ even     │ faster   │ competitive but more tables to parse  │
+│ 8-table join (Q8)       │ 0.5-1x  │ 1.5-3x  │ Maximum join depth — build side       │
+│                         │ even     │ faster   │ fits memory, probe is LINEITEM scan  │
+│ Subquery-heavy          │ 0.5-1x  │ 1-3x    │ Q2/Q17/Q20/Q21: DataFusion subquery  │
+│ (Q2, Q17, Q20, Q21)    │ even     │ faster   │ decorrelation quality matters         │
+│ With partitioned        │ 2-4x    │ 5-15x   │ Partition pruning skips entire heap   │
+│ LINEITEM (date filter)  │ faster   │ faster   │ files — massive I/O reduction         │
+└─────────────────────────┴──────────┴──────────┴──────────────────────────────────────┘
+```
+
+**Key insight**: TPC-H cold performance will be closer to PostgreSQL than ClickBench because
+join overhead dominates scan time. The real advantage shows on warm runs (cached Arrow batches)
+and with partitioned LINEITEM (partition pruning eliminates heap file I/O entirely).
+
+### Comparison Targets
+
+| System | Role | Source |
+|---|---|---|
+| PostgreSQL 17 (direct) | Baseline with indexes + shared buffers | Local |
+| pg_arrow + DataFusion (cold) | Worst case — all tables parsed from heap | Local |
+| pg_arrow + DataFusion (warm) | Target case — cached Arrow batches | Local |
+| DuckDB (from Parquet) | Analytics engine on pre-converted data | Local / published |
+| Hyper (Tableau) | Commercial hybrid engine reference | Published benchmarks |
+| DataFusion (standalone, Parquet) | Same engine, native format — ceiling | Local |
+
+## CH-benCHmark (HTAP Benchmarking)
+
+The [CH-benCHmark](https://db.in.tum.de/research/projects/CHbenCHmark/) (Cole et al., DBTest
+2011) is the standard benchmark for **hybrid transactional/analytical processing (HTAP)**
+systems. It runs TPC-C (OLTP) and TPC-H (OLAP) queries **concurrently** against the same
+dataset, measuring both transactional throughput and analytical latency under mixed workloads.
+This is the ideal benchmark for pg_arrow's sidecar architecture, where PostgreSQL handles OLTP
+writes and pg_arrow simultaneously serves OLAP reads. CH-benCHmark becomes relevant at
+**Phase 6+** (after wire protocol, query execution, and basic sidecar deployment work).
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        CH-benCHmark Driver                              │
+│                    (BenchBase or go-tpc)                                │
+├──────────────────────────┬──────────────────────────────────────────────┤
+│     OLTP Workers         │            OLAP Workers                      │
+│   (TPC-C transactions)   │         (TPC-H queries)                      │
+│                          │                                              │
+│  NewOrder, Payment,      │  Q1-Q22 (adapted to                         │
+│  OrderStatus, Delivery,  │   TPC-C schema names)                       │
+│  StockLevel              │                                              │
+└────────────┬─────────────┴──────────────┬───────────────────────────────┘
+             │ port 5432                  │ port 5433
+             ▼                            ▼
+┌────────────────────────┐   ┌────────────────────────────────────────────┐
+│     PostgreSQL          │   │              pg_arrow                      │
+│   (OLTP engine)         │   │         (OLAP engine)                      │
+│                         │   │                                            │
+│  TPC-C tables:          │   │  Reads same heap files (Mode 1/2)         │
+│  WAREHOUSE, DISTRICT,   │──▶│  OR receives logical stream (Mode 3)      │
+│  CUSTOMER, OORDER,      │   │                                            │
+│  ORDER_LINE, STOCK,     │   │  DataFusion executes TPC-H queries        │
+│  ITEM, NEW_ORDER,       │   │  on Arrow-converted data                   │
+│  HISTORY                │   │                                            │
+└────────────────────────┘   └────────────────────────────────────────────┘
+         │                              │
+         │  $PGDATA/ (heap files)       │ reads / replicates
+         └──────────────────────────────┘
+```
+
+### Schema Mapping
+
+CH-benCHmark maps TPC-H tables to TPC-C equivalents:
+
+| TPC-H Table | TPC-C Equivalent | Key Difference |
+|---|---|---|
+| LINEITEM | ORDER_LINE | ORDER_LINE has fewer columns, different names |
+| ORDERS | OORDER | OORDER uses `o_id` + `o_d_id` + `o_w_id` composite key |
+| CUSTOMER | CUSTOMER | Compatible — TPC-C CUSTOMER is superset |
+| STOCK | PARTSUPP | STOCK is keyed by (warehouse, item) |
+| ITEM | PART | ITEM is simpler (no PART attributes) |
+| SUPPLIER | — | Synthesized from STOCK data |
+| NATION | NATION | Added to TPC-C schema for CH-benCHmark |
+| REGION | REGION | Added to TPC-C schema for CH-benCHmark |
+
+### Setup
+
+**Option A: BenchBase (CMU, Java) — most complete CH-benCHmark implementation**
+
+```bash
+# 1. Clone and build BenchBase
+git clone https://github.com/cmu-db/benchbase.git && cd benchbase
+./mvnw clean package -P postgres -DskipTests
+
+# 2. Configure OLTP connection (PostgreSQL) and OLAP connection (pg_arrow)
+# Edit config/postgres/sample_chbenchmark_config.xml:
+#   <url>jdbc:postgresql://localhost:5432/chbench</url>    <!-- OLTP -->
+#   <url>jdbc:postgresql://localhost:5433/chbench</url>    <!-- OLAP -->
+#   <terminals>16</terminals>          <!-- OLTP concurrency -->
+#   <olap_terminals>4</olap_terminals> <!-- OLAP concurrency -->
+
+# 3. Create database and load TPC-C data
+createdb chbench
+java -jar benchbase.jar -b chbenchmark -c config/postgres/sample_chbenchmark_config.xml \
+     --create=true --load=true
+
+# 4. VACUUM FREEZE for pg_arrow
+psql -d chbench -c "VACUUM (FREEZE, ANALYZE)"
+
+# 5. Run mixed workload (OLTP + OLAP concurrent)
+java -jar benchbase.jar -b chbenchmark -c config/postgres/sample_chbenchmark_config.xml \
+     --execute=true
+```
+
+**Option B: go-tpc (PingCAP, Go) — lightweight alternative**
+
+```bash
+# 1. Install
+go install github.com/pingcap/go-tpc@latest
+
+# 2. Prepare TPC-C data (100 warehouses)
+go-tpc tpcc prepare -H localhost -P 5432 -D chbench --warehouses 100
+
+# 3. Run OLTP-only baseline (5 minutes)
+go-tpc tpcc run -H localhost -P 5432 -D chbench --warehouses 100 \
+    --threads 16 --time 5m
+
+# 4. Run CH-benCHmark (OLTP + OLAP concurrent, 10 minutes)
+go-tpc ch run -H localhost -P 5432 -D chbench --warehouses 100 \
+    --oltp-threads 16 --olap-addr localhost:5433 --olap-threads 4 --time 10m
+```
+
+### Key Metrics
+
+**1. OLTP Throughput (tpmC)**
+
+Does pg_arrow's concurrent heap file reading degrade PostgreSQL's write performance?
+
+| Scenario | Expected tpmC | Impact |
+|---|---|---|
+| PostgreSQL only (baseline) | X | — |
+| PG + pg_arrow Mode 1 (shared primary) | 0.95-1.0x | Minimal — pg_arrow reads don't take locks |
+| PG + pg_arrow Mode 2 (promotable replica) | 1.0x | Zero — separate data directory |
+| PG + pg_arrow Mode 3 (logical replica) | 0.98-1.0x | Slight — logical decoding overhead |
+
+**2. Analytical QPS (queries/hour)**
+
+How many of the 22 TPC-H-style queries complete per hour under OLTP load?
+
+| System | Expected QpH@SF10 | Notes |
+|---|---|---|
+| PostgreSQL (OLTP+OLAP same instance) | 50-200 | Lock contention, shared buffers thrashed |
+| pg_arrow Mode 1 (sidecar + primary) | 500-2000 | Columnar scan, no lock contention |
+| pg_arrow Mode 2 (sidecar + replica) | 500-2000 | Same perf, zero OLTP impact |
+| pg_arrow Mode 3 (logical replica) | 1000-4000 | Arrow-native storage, no heap parsing |
+
+**3. Freshness Lag**
+
+Time between a PostgreSQL COMMIT and the data being visible in pg_arrow queries:
+
+| Deployment Mode | Expected Lag | Mechanism |
+|---|---|---|
+| Mode 1 (sidecar + primary) | 0-10ms | Direct heap read — visible after fsync |
+| Mode 2 (sidecar + replica) | 10-100ms | WAL replay delay on standby |
+| Mode 3 (logical replica) | 50-500ms | Logical decoding → apply → visible |
+
+### Freshness Measurement
+
+Practical probe approach to measure data freshness lag:
+
+```sql
+-- On PostgreSQL (OLTP side): insert marker row with precise timestamp
+INSERT INTO freshness_probe (probe_id, inserted_at)
+VALUES (gen_random_uuid(), clock_timestamp());
+
+-- On pg_arrow (OLAP side): poll for the marker row
+SELECT clock_timestamp() - inserted_at AS freshness_lag
+FROM freshness_probe
+WHERE probe_id = '<uuid>';
+```
+
+Run this probe every second during the benchmark. Report: P50, P95, P99, max freshness lag.
+
+### Expected Performance Profile
+
+```
+┌──────────────────────────┬─────────┬──────────┬──────────┬─────────────────┐
+│ OLTP Concurrency         │  tpmC   │ OLAP QpH │ P50 Lag  │ P99 Lag         │
+├──────────────────────────┼─────────┼──────────┼──────────┼─────────────────┤
+│ 0 threads (OLAP only)    │    —    │  2000+   │   0ms    │   0ms           │
+│ 8 threads                │  ~8K    │  1500+   │  <10ms   │  <100ms         │
+│ 16 threads               │  ~15K   │  1200+   │  <10ms   │  <200ms         │
+│ 32 threads               │  ~25K   │  800+    │  <20ms   │  <500ms         │
+│ 64 threads (stress)      │  ~35K   │  500+    │  <50ms   │  <1s            │
+└──────────────────────────┴─────────┴──────────┴──────────┴─────────────────┘
+```
+
+**Key insight**: pg_arrow's value is that OLAP QpH degrades gracefully under OLTP load (not
+catastrophically like running TPC-H queries directly on the OLTP PostgreSQL instance), and
+OLTP tpmC is minimally affected by concurrent OLAP reads.
+
+### Other HTAP Benchmarks
+
+For completeness, other HTAP benchmarks exist but CH-benCHmark is recommended as the starting
+point:
+
+- **HyBench** (VLDB 2024) — Financial-domain HTAP benchmark with realistic data distributions
+  and temporal access patterns. More domain-specific than CH-benCHmark but valuable for
+  demonstrating pg_arrow in financial analytics use cases.
+- **TPC-DS** — 99 queries, 24 tables, more complex schema than TPC-H. A future goal after
+  TPC-H correctness is validated. Stresses subquery decorrelation and complex joins more
+  heavily than TPC-H.
+- **HTAPBench** (Coelho et al., 2017) — Earlier HTAP benchmark, largely superseded by
+  CH-benCHmark in academic use.
+
+**Recommendation**: Start with CH-benCHmark (broadest tool support, most cited in HTAP
+literature, directly reuses TPC-C/TPC-H infrastructure). Add HyBench or TPC-DS as stretch
+goals once TPC-H correctness is proven.
+
 ## Limitations
 
 1. ⚠️ **Single machine** (both on same host for true zero-copy)
@@ -5049,6 +6278,15 @@ For context, include these systems in benchmark reports:
     - Known extensions (pgvector, hstore) get typed Arrow representations in Phase 7+
     - See "Extension Type Handling" section
 
+15. ⚠️ **Shared buffer lag requires WAL replay for full consistency (Modes 1 & 2)**
+    - Heap file pages on disk lag behind PostgreSQL's shared buffers — committed data may not be on disk
+    - Different pages are at different LSNs (cross-page inconsistency)
+    - Full consistency requires replaying WAL records onto stale pages to bring them to a common target_lsn
+    - WAL parser is ~2000-3000 lines of version-specific code (PG WAL format is not a stable API)
+    - Phase 1-2 can start with Tier 1 (MVCC-only, no WAL replay) — correct for data on disk but misses very recently committed unflushed rows
+    - Mode 2 (replica with paused replay) sidesteps WAL replay entirely — all pages consistent at replay LSN
+    - See "Read Consistency for Direct Heap File Access" section
+
 ## Recommended Implementation Plan
 
 ### Phase 0: Cluster Validation and Foundation (1-2 weeks)
@@ -5079,9 +6317,10 @@ For context, include these systems in benchmark reports:
 ### Phase 2: MVCC Consistency (4-6 weeks)
 
 - [ ] **2a - Frozen-only reads** (1 week): Return only `HEAP_XMIN_FROZEN` tuples (always visible, no CLOG needed). Use visibility map to identify all-frozen pages for fast path.
-- [ ] **2b - CLOG reader** (2 weeks): Implement `pg_xact/` reader, hint-bit-aware visibility, snapshot via `pg_current_snapshot()`, batched CLOG lookups (collect unique xids per page, read CLOG page once)
+- [ ] **2b - CLOG reader + Tier 1 consistency** (2 weeks): Implement `pg_xact/` reader, hint-bit-aware visibility, snapshot via `pg_current_snapshot()`, batched CLOG lookups (collect unique xids per page, read CLOG page once). This is Tier 1 consistency — correct for data on disk but may miss very recently committed unflushed rows (acceptable for analytics).
 - [ ] **2c - Full visibility** (2-3 weeks): MultiXact resolution, subtransaction handling, HOT chain traversal
 - [ ] **Isolation levels**: Per-connection snapshot tracking — READ COMMITTED (new snapshot per statement) vs REPEATABLE READ (snapshot held for transaction)
+- [ ] **2d - WAL replay for Tier 2 consistency** (shared with Phase 12b): WAL page/record header parser, heap WAL record application (`xl_heap_insert/delete/update`), FPI extraction. Read `pd_lsn` from each page header, replay WAL records from `pd_lsn..target_lsn` to bring stale pages current. Target LSN via `pg_current_wal_flush_lsn()`. This ensures full consistency including unflushed committed data. See "Read Consistency for Direct Heap File Access" section.
 
 ### Phase 3: Wire Protocol (3-4 weeks)
 
@@ -5240,11 +6479,19 @@ For context, include these systems in benchmark reports:
   - Run 43 queries: cold (no cache) and warm (cached)
   - Compare against PostgreSQL direct, record speedup ratios
   - Track regressions across releases
+- [ ] **TPC-H benchmark** (Phase 4+):
+  - Load SF10 into PostgreSQL (partitioned LINEITEM)
+  - Run 22 queries: compare pg_arrow vs PostgreSQL baseline
+  - Track per-query speedup, correctness validation
+- [ ] **CH-benCHmark HTAP** (Phase 6+):
+  - BenchBase or go-tpc setup with split OLTP/OLAP connections
+  - Measure tpmC, analytical QPS, freshness lag
+  - Baseline: OLTP-only vs OLTP+OLAP concurrent
 - [ ] **CI pipeline** (``.github/workflows/ci.yml``):
   - Every commit: unit, differential, property, chaos, snapshot, cross-version
   - Nightly: fuzz (extended), stress, Miri, sanitizers
   - Weekly: mutation testing, coverage reports
-  - Pre-release: ClickBench full run
+  - Pre-release: ClickBench, TPC-H, CH-benCHmark full runs
 
 ### Phase 12: Deployment Modes and WAL Synchronization (5-8 weeks)
 
@@ -5305,30 +6552,3 @@ For context, include these systems in benchmark reports:
 **Total**: 33-50 weeks for full production-ready system with all deployment modes, ecosystem integrations, and testing infrastructure
 
 ---
-
-## Final Answer: When to Read Data Files?
-
-**During query execution, on-demand, page-by-page**
-
-```rust
-// Timeline:
-
-// PostgreSQL writes → You do NOTHING
-// PostgreSQL commits → You do NOTHING
-// PostgreSQL flushes → You do NOTHING
-
-// User queries pg_arrow → You READ data files NOW
-//   └─ Read pages as DataFusion needs them
-//   └─ Convert to Arrow in-memory
-//   └─ Free memory after query
-
-// Next query → Read fresh from files again
-```
-
-**Never** read on commits/flushes. **Only** read when executing queries.
-
-This is the architecture you want! Want me to start implementing it?
-
-# User Reponses
-
-- We have some what good design now.
