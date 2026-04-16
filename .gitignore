@@ -17,3 +17,8 @@ Cargo.lock
 testdata/
 pg-test-config.toml
 
+# Profiling artifacts
+flamegraph.svg
+perf.data
+perf.data.old
+

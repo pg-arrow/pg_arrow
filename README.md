@@ -10,15 +10,15 @@
    - Page items
    - Row header
    - Row content
-   - Column values
+   - Column values -
      - TOASTed data
      - Encoding/Compression
 2. Table Scan
    - Sync Reader
    - Page iterator
    - Row iterator
-   - Async Reader
-3. Catalog Reader
+   - Async Reader -
+3. Catalog Reader -
    - pg_catalog finder and reader
 4. PG Arrow extender type
    - Support user defined data parser

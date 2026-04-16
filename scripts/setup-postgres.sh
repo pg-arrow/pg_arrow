@@ -178,7 +178,7 @@ setup_worktree() {
 	else
 		log_info "Creating worktree for branch '$branch'..."
 		cd "$repo_dir"
-		git worktree add "$worktree_dir" "$branch" || log_error "Failed to create worktree"
+		git worktree add -f "$worktree_dir" "$branch" || log_error "Failed to create worktree"
 		cd "$PROJECT_ROOT"
 		log_success "Worktree created at $worktree_dir"
 	fi
