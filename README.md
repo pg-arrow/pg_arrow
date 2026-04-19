@@ -1,27 +1,57 @@
-# PG Arrow
+# pg_arrow
 
-## Development
+Low-level library for reading PostgreSQL data files directly and converting them to [Apache Arrow](https://arrow.apache.org/) format. Used by [pgfusion](../pgfusion/) as the page-parsing and Arrow conversion layer.
 
-### TODO
+## Prerequisites
 
-1. Write test to read from db datafile and parse and validate the postgres table data.
-   - Page size
-   - Page header
-   - Page items
-   - Row header
-   - Row content
-   - Column values -
-     - TOASTed data
-     - Encoding/Compression
-2. Table Scan
-   - Sync Reader
-   - Page iterator
-   - Row iterator
-   - Async Reader -
-3. Catalog Reader -
-   - pg_catalog finder and reader
-4. PG Arrow extender type
-   - Support user defined data parser
+- **Rust** — [rustup.rs](https://rustup.rs)
+- **just** — command runner for all recipes
+
+```bash
+# macOS
+brew install just
+
+# Linux / Windows (via cargo)
+cargo install just
+
+# All platforms (pre-built binary)
+curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to ~/.local/bin
+```
+
+For flamegraph and profiling recipes:
+
+```bash
+cargo install cargo-flamegraph  # flamegraph-* recipes
+cargo install samply            # samply-* recipes
+```
+
+## Quick start
+
+```bash
+# Build
+cargo build
+
+# Run the table_reader example
+just example-table-reader /path/to/pgdata 16384
+
+# Run tests
+just test
+```
+
+## Common commands
+
+```bash
+just build                    # Debug build
+just release                  # Release build
+just test                     # Unit tests
+just bench                    # Criterion benchmarks
+just bench-iai                # iai instruction-count benchmarks
+just bench-io                 # File I/O latency benchmarks
+just flamegraph-bench         # Flamegraph for criterion bench
+just flamegraph-example /path/to/pgdata  # Flamegraph for table_reader example
+just doc                      # Open rustdoc
+just --list                   # Show all available recipes
+```
 
 ## PostgreSQL Setup for Testing
 
@@ -29,163 +59,90 @@
 
 Use `scripts/setup-postgres.sh` to automate PostgreSQL setup for testing:
 
-#### Basic Usage (Source Only)
-
 ```bash
-# Setup latest/master branch (source code + data directory only)
-./scripts/setup-postgres.sh
+# Full setup: build from source, init cluster, load test data
+just pg-setup pg18            # or pg17 / latest
 
-# Setup specific version using friendly names
-./scripts/setup-postgres.sh --branch pg18
-./scripts/setup-postgres.sh -b pg17
-./scripts/setup-postgres.sh -b pg16
+# Full setup with simple schema (no pgbench tables)
+just pg-setup-simple pg18
 
-# Or use full branch names
-./scripts/setup-postgres.sh -b REL_18_STABLE
+# Individual steps
+just pg-build pg18            # Build PostgreSQL source only
+just pg-init pg18             # Init cluster (source must be built)
+just pg-testdata pg18         # Load test data into initialised cluster
 ```
 
-#### Full Setup (Build + Initialize + Test Data)
+Or invoke the script directly:
 
 ```bash
-# Complete setup with build, initialization, and full e-commerce test data
-./scripts/setup-postgres.sh --build --init --test-data
-
-# Setup PG 18 with everything (short form)
-./scripts/setup-postgres.sh -b pg18 -B -i -t
-
-# Setup with simple single-table schema
-./scripts/setup-postgres.sh -b latest -B -i -t -s
-
-# Setup latest with everything
-./scripts/setup-postgres.sh -b latest -B -i -t
+./scripts/setup-postgres.sh -b pg18 -B -i -t      # pg18, full setup
+./scripts/setup-postgres.sh -b latest -B -i -t -s  # latest, simple schema
 ```
 
-#### Options
+#### Script options
 
-- `-b, --branch VERSION`: Version/branch name (default: latest)
-  - Friendly names: `pg18`, `pg17`, `pg16`, `latest`
-  - Full branch names: `master`, `REL_18_STABLE`, `REL_17_STABLE`, etc.
-- `-B, --build`: Build PostgreSQL locally using meson/ninja
-- `-i, --init`: Initialize database cluster (requires --build)
-- `-t, --test-data`: Create test database with sample tables (requires --init)
-- `-s, --simple-schema`: Use simple single-table schema instead of full e-commerce schema
-- `-h, --help`: Show usage information
+| Flag | Description |
+|---|---|
+| `-b, --branch VERSION` | `pg18`, `pg17`, `pg16`, `latest`, or full branch name |
+| `-B, --build` | Build PostgreSQL locally (meson/ninja) |
+| `-i, --init` | Initialize database cluster |
+| `-t, --test-data` | Create test database with sample data |
+| `-s, --simple-schema` | Single-table schema instead of full e-commerce schema |
 
-#### What the Script Does
+#### What the script does
 
 1. Clones PostgreSQL from <https://git.postgresql.org/git/postgresql.git> into `testdata/postgres/`
-2. Maps version name to branch (pg18 → REL_18_STABLE, latest → master)
-3. Creates git worktree in `testdata/postgres-{version}/` directory
-4. Creates data directory at `testdata/postgres-{version}/data/`
-5. Optionally builds PostgreSQL locally (installs to `testdata/postgres-{version}/install/`)
-6. Optionally initializes database cluster using current user (no postgres user needed)
-7. Optionally creates test database with schema:
-   - Simple: Single table with all common datatypes (use `-s` flag)
-   - Full: E-commerce schema with 5 tables and relationships (default)
-8. Writes configuration to `pg-test-config.toml`
-9. Prints setup summary to stdout
+2. Creates a git worktree in `testdata/postgres-{version}/`
+3. Optionally builds PostgreSQL locally (installs to `testdata/postgres-{version}/install/`)
+4. Optionally initializes the database cluster (no root/postgres user needed)
+5. Optionally creates a test database and loads schema + sample data
+6. Writes paths to `pg-test-config.toml` for use in Rust tests
 
-**Note**: Everything is installed locally within the project's `testdata/` directory - no system-wide installation or special user privileges required.
-
-#### Directory Structure
-
-After running the setup script, your project will have this structure:
+#### Directory structure after setup
 
 ```
 pg_arrow/
 ├── testdata/
 │   ├── postgres/              # Main PostgreSQL git repository
 │   ├── postgres-latest/       # Worktree for master branch
-│   │   ├── data/              # PostgreSQL data directory
-│   │   ├── build/             # Meson build directory
-│   │   └── install/
-│   │       └── bin/           # PostgreSQL binaries
-│   └── postgres-pg18/         # Worktree for REL_18_STABLE
+│   │   ├── data/
+│   │   ├── build/
+│   │   └── install/bin/
+│   └── postgres-pg18/
 │       ├── data/
 │       ├── build/
-│       └── install/
-│           └── bin/
-├── pg-test-config.toml        # Configuration file with paths
+│       └── install/bin/
+├── pg-test-config.toml
 └── scripts/
-    └── setup-postgres.sh      # Setup script
+    └── setup-postgres.sh
 ```
 
-#### Configuration File
+#### `pg-test-config.toml` format
 
-The script generates `pg-test-config.toml` with paths for use in Rust tests:
+Generated by the setup script. Read programmatically in tests — never hardcode paths.
 
 ```toml
-[postgres.latest]
-version = "master"
-source_dir = "/path/to/project/testdata/postgres-latest"
-data_dir = "/path/to/project/testdata/postgres-latest/data"
-install_dir = "/path/to/project/testdata/postgres-latest/install"
-bin_dir = "/path/to/project/testdata/postgres-latest/install/bin"
-initialized = true
-test_db_created = true
-
 [postgres.pg18]
 version = "REL_18_STABLE"
-source_dir = "/path/to/project/testdata/postgres-pg18"
-data_dir = "/path/to/project/testdata/postgres-pg18/data"
-install_dir = "/path/to/project/testdata/postgres-pg18/install"
-bin_dir = "/path/to/project/testdata/postgres-pg18/install/bin"
+source_dir = "/path/to/testdata/postgres-pg18"
+data_dir = "/path/to/testdata/postgres-pg18/data"
+bin_dir = "/path/to/testdata/postgres-pg18/install/bin"
 initialized = true
 test_db_created = true
 ```
 
-#### Test Database Schema
+#### Test database schemas
 
-When using `--test-data`, a test database is created with one of two schemas:
+**Simple schema** (`-s` flag): single `test_types` table covering all common PostgreSQL datatypes — ideal for basic parsing tests.
 
-**Simple Schema** (use `-s` flag):
+**Full e-commerce schema** (default): 5 tables (`categories`, `products`, `customers`, `orders`, `order_items`) with foreign keys, multiple index types, and ~20 rows of sample data.
 
-- Single table: `test_types`
-- All common PostgreSQL datatypes: INTEGER, BIGINT, SMALLINT, NUMERIC, REAL, DOUBLE PRECISION, VARCHAR, TEXT, CHAR, BOOLEAN, DATE, TIMESTAMP, TIMESTAMPTZ, JSONB, BYTEA, UUID
-- Basic indexes (B-tree and GIN for JSONB)
-- 5 sample rows with edge cases (max values, negatives, zeros, NULLs, unicode)
-- Ideal for basic datatype parsing tests
-
-**Full E-commerce Schema** (default):
-
-- 5 tables: `categories`, `products`, `customers`, `orders`, `order_items`
-- Multiple foreign key relationships including self-referencing
-- Various datatypes: SERIAL, BIGSERIAL, VARCHAR, TEXT, NUMERIC, REAL, BOOLEAN, DATE, TIMESTAMP, JSONB, BYTEA
-- Comprehensive indexing: PRIMARY, UNIQUE, B-tree, GIN
-- ~20+ rows of realistic sample data
-- Ideal for testing complex relationships and real-world scenarios
-
-### Manual Setup
-
-If you prefer manual setup, here are step-by-step instructions for local installation:
+### pgbackrest
 
 ```bash
-# Clone PostgreSQL source
-git clone https://git.postgresql.org/git/postgresql.git postgres
-cd postgres
-
-# Checkout specific branch if needed
-git checkout REL_18_STABLE
-
-# Build and install locally (no root/su needed)
-meson setup build --prefix=$PWD/install
-cd build
-ninja
-ninja install
-
-# Initialize database cluster as current user
-cd ..
-mkdir -p data
-./install/bin/initdb -D ./data
-
-# Start PostgreSQL
-./install/bin/pg_ctl -D ./data -l logfile start
-
-# Create test database
-./install/bin/createdb test
-
-# Connect to database
-./install/bin/psql test
+just backup-setup             # Configure WAL archiving
+just backup-full              # Full backup
+just backup-incr              # Incremental backup
+just backup-info              # Show backup info
+just backup-restore /path     # Restore to directory
 ```
-
-**Note**: The script automates this process and supports multiple versions simultaneously using git worktrees.
