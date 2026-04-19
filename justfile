@@ -6,106 +6,136 @@ pg_version := env_var_or_default("PG_VERSION", "pg18")
 
 # ── Default ───────────────────────────────────────────────────────────────────
 
+[group('default')]
 default:
     @just --list
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 # Debug build
+[group('build')]
 build:
     cargo build
 
 # Release build
+[group('build')]
 release:
     cargo build --release
 
 # ── Lint & Format ─────────────────────────────────────────────────────────────
 
+[group('lint')]
 fmt:
     cargo fmt
 
+[group('lint')]
 fmt-check:
     cargo fmt --check
 
+[group('lint')]
 clippy:
     cargo clippy -- -D warnings
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
+[group('test')]
 test:
     cargo test
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 
 # Criterion statistical benchmarks (optional filter regex)
+[group('bench')]
 bench filter="":
     cargo bench --bench criterion_bench -- {{filter}}
 
 # iai instruction-count benchmarks
+[group('bench')]
 bench-iai:
     cargo bench --bench iai_bench
 
 # File I/O latency benchmarks
+[group('bench')]
 bench-io:
     cargo bench --bench file_read_latency
 
 # Run all benchmarks
+[group('bench')]
 bench-all: bench bench-iai bench-io
 
 # ── Examples ──────────────────────────────────────────────────────────────────
 
-# Run the table_reader example
 # Usage: just example-table-reader /path/to/pgdata 16384
+[group('examples')]
 example-table-reader data_dir db_id="16384":
     cargo run --example table_reader -- {{data_dir}} {{db_id}}
+
+# ── PostgreSQL CLI ────────────────────────────────────────────────────────────
+
+# Open a psql session for a given PostgreSQL version
+# Usage: just psql pg18   or   just psql pg18 test
+[group('postgres')]
+psql pg=pg_version db="postgres":
+    @bin=$(awk -v s="postgres.{{pg}}" '$0~"\\["s"\\]"{f=1} f&&$1=="bin_dir"{gsub(/.*= *"|"$/,""); print $0; exit}' pg-test-config.toml); \
+     DYLD_LIBRARY_PATH="$bin/../lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" "$bin/psql" {{db}}
 
 # ── PostgreSQL Setup ──────────────────────────────────────────────────────────
 
 # Full setup: build from source, init cluster, load test data
 # Usage: just pg-setup pg18   (or pg17 / latest)
+[group('postgres')]
 pg-setup pg=pg_version:
     bash scripts/setup-postgres.sh -b {{pg}} -B -i -t
 
 # Full setup with simple schema (no pgbench tables)
+[group('postgres')]
 pg-setup-simple pg=pg_version:
     bash scripts/setup-postgres.sh -b {{pg}} -B -i -t -s
 
 # Build PostgreSQL source only
+[group('postgres')]
 pg-build pg=pg_version:
     bash scripts/setup-postgres.sh -b {{pg}} -B
 
 # Init cluster only (source must already be built)
+[group('postgres')]
 pg-init pg=pg_version:
     bash scripts/setup-postgres.sh -b {{pg}} -i
 
 # Load test data into an already-initialised cluster
+[group('postgres')]
 pg-testdata pg=pg_version:
     bash scripts/setup-postgres.sh -b {{pg}} -t
 
 # ── pgbackrest ────────────────────────────────────────────────────────────────
 
 # Configure pgbackrest for WAL archiving
+[group('backup')]
 backup-setup:
     bash scripts/pgbackrest-backup.sh setup
 
 # Full backup
+[group('backup')]
 backup-full:
     bash scripts/pgbackrest-backup.sh full
 
 # Incremental backup
+[group('backup')]
 backup-incr:
     bash scripts/pgbackrest-backup.sh incr
 
 # Differential backup
+[group('backup')]
 backup-diff:
     bash scripts/pgbackrest-backup.sh diff
 
 # Show backup information
+[group('backup')]
 backup-info:
     bash scripts/pgbackrest-backup.sh info
 
-# Restore from backup
 # Usage: just backup-restore /path/to/restore/dir
+[group('backup')]
 backup-restore target_dir:
     bash scripts/pgbackrest-backup.sh restore -t {{target_dir}}
 
@@ -113,37 +143,44 @@ backup-restore target_dir:
 
 # Flamegraph for criterion bench (requires cargo-flamegraph + perf/dtrace)
 # Usage: just flamegraph-bench criterion_bench
+[group('profiling')]
 flamegraph-bench bench="criterion_bench":
     cargo flamegraph --bench {{bench}} -o flamegraph.svg
     open flamegraph.svg
 
 # Flamegraph for a specific test
 # Usage: just flamegraph-test test_parse_large_table
+[group('profiling')]
 flamegraph-test test_name:
     cargo flamegraph --test {{test_name}} -o flamegraph.svg
     open flamegraph.svg
 
 # Flamegraph for the table_reader example
 # Usage: just flamegraph-example /path/to/pgdata 16384
+[group('profiling')]
 flamegraph-example data_dir db_id="16384":
     cargo flamegraph --example table_reader -o flamegraph.svg -- {{data_dir}} {{db_id}}
     open flamegraph.svg
 
 # Samply CPU profile for a bench (macOS/Linux — opens in browser)
 # Usage: just samply-bench criterion_bench
+[group('profiling')]
 samply-bench bench="criterion_bench":
     samply record cargo bench --bench {{bench}}
 
 # Samply CPU profile for a specific test
 # Usage: just samply-test test_parse_large_table
+[group('profiling')]
 samply-test test_name:
     samply record cargo test --release {{test_name}} -- --nocapture
 
 # Open the last generated flamegraph
+[group('profiling')]
 flamegraph-open:
     open flamegraph.svg
 
 # ── Docs ──────────────────────────────────────────────────────────────────────
 
+[group('docs')]
 doc:
     cargo doc --open --no-deps
