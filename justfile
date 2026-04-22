@@ -22,6 +22,35 @@ build:
 release:
     cargo build --release
 
+# Install sccache and configure it automatically in .cargo/config.toml
+# Default cache: ~/Library/Caches/Mozilla.sccache (macOS) or ~/.cache/sccache (Linux), 10GB
+# Override: SCCACHE_CACHE_SIZE=20G  or  SCCACHE_DIR=/custom/path
+[group('build')]
+sccache-setup:
+    @if ! command -v sccache >/dev/null 2>&1; then \
+        echo "Installing sccache..."; \
+        cargo install sccache; \
+    else \
+        echo "sccache already installed: $(sccache --version)"; \
+    fi
+    @mkdir -p .cargo
+    @if ! grep -q 'rustc-wrapper.*sccache' .cargo/config.toml 2>/dev/null; then \
+        if grep -q '^\[build\]' .cargo/config.toml 2>/dev/null; then \
+            awk '/^\[build\]/{print; print "rustc-wrapper = \"sccache\""; next} 1' \
+                .cargo/config.toml > .cargo/config.toml.tmp && mv .cargo/config.toml.tmp .cargo/config.toml; \
+        else \
+            { [ -s .cargo/config.toml ] && printf '\n'; printf '[build]\nrustc-wrapper = "sccache"\n'; } >> .cargo/config.toml; \
+        fi; \
+        echo "sccache configured in .cargo/config.toml"; \
+    else \
+        echo "sccache already configured in .cargo/config.toml"; \
+    fi
+
+# Show sccache statistics (run after a build to verify cache hits)
+[group('build')]
+sccache-stats:
+    sccache --show-stats
+
 # ── Lint & Format ─────────────────────────────────────────────────────────────
 
 [group('lint')]
