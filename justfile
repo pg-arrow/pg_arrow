@@ -7,8 +7,8 @@ pg_version := env_var_or_default("PG_VERSION", "pg18")
 # ── Default ───────────────────────────────────────────────────────────────────
 
 [group('default')]
-default:
-    @just --list
+help:
+    @just --list --unsorted
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
