@@ -168,10 +168,7 @@ mod tests {
 
         // ── Step 1: Scan pg_class to find a user table ─────────────────────
         let pg_class_schema = PgClass::catalog_schema();
-        let pg_class_reader = TableFileReader {
-            db_id,
-            relation_id: PgClass::RELATION_OID as usize,
-        };
+        let pg_class_reader = TableFileReader::new(db_id, PgClass::RELATION_OID as usize);
 
         let mut target_table: Option<PgClass> = None;
         for row_result in pg_class_reader.get_page_reader().unwrap().into_iter() {
@@ -198,10 +195,7 @@ mod tests {
 
         // ── Step 2: Scan pg_attribute for this table's columns ─────────────
         let pg_attr_schema = PgAttribute::catalog_schema();
-        let pg_attr_reader = TableFileReader {
-            db_id,
-            relation_id: PgAttribute::RELATION_OID as usize,
-        };
+        let pg_attr_reader = TableFileReader::new(db_id, PgAttribute::RELATION_OID as usize);
 
         let mut table_attrs: Vec<PgAttribute> = Vec::new();
         for row_result in pg_attr_reader.get_page_reader().unwrap().into_iter() {
@@ -240,10 +234,7 @@ mod tests {
         );
 
         // ── Step 4: Read the actual table rows using the dynamic schema ────
-        let table_reader = TableFileReader {
-            db_id,
-            relation_id: table.relfilenode as usize,
-        };
+        let table_reader = TableFileReader::new(db_id, table.relfilenode as usize);
 
         let mut row_count = 0usize;
         let mut output = String::new();

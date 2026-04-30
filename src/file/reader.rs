@@ -534,7 +534,9 @@ impl<R: ChunkReader> Iterator for PageRowIter<R> {
                     current_row_info.ctid.ip_blkid.bi_lo = (next_page_block_number + 1) as u16;
                     current_row_info.ctid.ip_blkid.bi_hi =
                         ((next_page_block_number + 1) as u32 >> 16) as u16;
-                    current_row_info.ctid.ip_posid = 0;
+                    // u16::MAX wraps to 0 via wrapping_add(1) below, so slot 0
+                    // of the new page is not skipped.
+                    current_row_info.ctid.ip_posid = u16::MAX;
                 }
             }
 
@@ -553,7 +555,7 @@ impl<R: ChunkReader> Iterator for PageRowIter<R> {
                         },
                     },
                     ip_posid: if let Some(_row_info) = self.current_row_info.as_ref() {
-                        self.current_row_info.as_ref().unwrap().ctid.ip_posid + 1
+                        self.current_row_info.as_ref().unwrap().ctid.ip_posid.wrapping_add(1)
                     } else {
                         0
                     },

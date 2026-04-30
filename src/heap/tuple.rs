@@ -299,7 +299,7 @@ impl HeapTupleData {
         //         .copied()
         //         .unwrap_or(0xFF)
         // );
-
+        //
         // Check null bitmap: bit=0 means NULL in PostgreSQL convention.
         if self
             .null_bitmap
@@ -312,6 +312,7 @@ impl HeapTupleData {
 
         let res = decode_datum(col.type_id, &self.data, column_offset)
             .map_err(|e| PgError::DecodeError(e.to_string()))?;
+
         Ok(res)
     }
 

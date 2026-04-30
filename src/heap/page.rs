@@ -6,7 +6,7 @@ use derive_where::derive_where;
 
 use crate::codec::{PgTypeId, PgTypeLen, skip_datum};
 use crate::file::error;
-use crate::heap::tuple::{HeapTupleData, InfoMask, HEAP_NATTS_MASK, SIZEOF_HEAP_TUPLE_HEADER};
+use crate::heap::tuple::{HEAP_NATTS_MASK, HeapTupleData, InfoMask, SIZEOF_HEAP_TUPLE_HEADER};
 use crate::table::{ColumnBuilder, extract_column_bytes, extract_fixed_bytes};
 use crate::types::PgSchema;
 
@@ -410,8 +410,11 @@ impl HeapPageData {
                             data_offset += fixed_n;
                         } else {
                             // Variable-length path (varlena/cstring).
-                            let (bytes, consumed) =
-                                extract_column_bytes(type_lens[col_index], tuple_data, data_offset)?;
+                            let (bytes, consumed) = extract_column_bytes(
+                                type_lens[col_index],
+                                tuple_data,
+                                data_offset,
+                            )?;
                             builders[out_idx].append_bytes(bytes)?;
                             data_offset += consumed;
                         }
@@ -421,8 +424,9 @@ impl HeapPageData {
                             // Fixed-width skip: just advance offset, no function call.
                             data_offset += fixed_n;
                         } else {
-                            let consumed = skip_datum(type_lens[col_index], tuple_data, data_offset)
-                                .map_err(|e| error::PgError::DecodeError(e.to_string()))?;
+                            let consumed =
+                                skip_datum(type_lens[col_index], tuple_data, data_offset)
+                                    .map_err(|e| error::PgError::DecodeError(e.to_string()))?;
                             data_offset += consumed;
                         }
                     }
@@ -434,8 +438,10 @@ impl HeapPageData {
         let arrays: Vec<_> = builders.into_iter().map(|b| b.finish()).collect();
         let arrow_schema = Arc::new(batch_schema.to_arrow_schema());
 
-        RecordBatch::try_new(arrow_schema, arrays).map_err(|e| error::PgError::ArrowConversionFailed {
-            detail: e.to_string(),
+        RecordBatch::try_new(arrow_schema, arrays).map_err(|e| {
+            error::PgError::ArrowConversionFailed {
+                detail: e.to_string(),
+            }
         })
     }
 }
@@ -449,9 +455,10 @@ pub fn read_line_pointer(page: &[u8], index: usize) -> ItemIdData {
 #[cfg(test)]
 mod tests {
     use arrow::array::{Array, StringArray, UInt32Array};
+    use arrow::compute::{filter_record_batch, kernels::cmp::eq};
 
     use crate::file::reader::TableFileReader;
-    use crate::types::{PgCatalogRelation, PgClass};
+    use crate::types::{PgAttribute, PgCatalogRelation, PgClass};
 
     #[test]
     fn test_page_to_record_batch_all_columns() {
@@ -493,7 +500,11 @@ mod tests {
         let batch = page.to_record_batch(&schema, Some(projection)).unwrap();
 
         assert!(batch.num_rows() > 0);
-        assert_eq!(batch.num_columns(), 3, "projected batch should have 3 columns");
+        assert_eq!(
+            batch.num_columns(),
+            3,
+            "projected batch should have 3 columns"
+        );
 
         // Verify schema field names match the projected columns.
         let fields = batch.schema();
@@ -614,10 +625,7 @@ mod tests {
             parallel_first.num_rows(),
             "page 0 row count should match between sequential and parallel"
         );
-        assert_eq!(
-            sequential_batch.num_columns(),
-            parallel_first.num_columns(),
-        );
+        assert_eq!(sequential_batch.num_columns(), parallel_first.num_columns(),);
 
         // Spot-check: compare the relname column (index 1).
         let seq_names = sequential_batch
@@ -648,23 +656,55 @@ mod tests {
 
     #[test]
     fn test_batch_stream_yields_incrementally() {
-        let schema = PgClass::catalog_schema();
-        let reader = TableFileReader::new(16384, PgClass::RELATION_OID as usize);
+        let schema = PgAttribute::catalog_schema();
+        let reader = TableFileReader::new(16727, PgAttribute::RELATION_OID as usize);
         let page_reader = reader.get_page_reader().unwrap();
 
         // Use a small batch size to force multiple fill_buffer rounds.
         let stream = page_reader
             .into_batch_stream(&schema, None)
-            .with_pages_per_batch(1);
+            .with_pages_per_batch(1000);
+
+        const FILTER_ATTRELID: u32 = 16728;
 
         let mut count = 0;
         let mut total_rows = 0;
+        let mut filtered_rows = 0;
         for batch_result in stream {
             let batch = batch_result.unwrap();
             assert_eq!(batch.num_columns(), schema.num_columns());
             total_rows += batch.num_rows();
             count += 1;
+
+            // Filter rows where attrelid (col 0) == 16728.
+            let attrelid_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("col 0 should be UInt32Array");
+            let scalar = UInt32Array::new_scalar(FILTER_ATTRELID);
+            let mask = eq(attrelid_col, &scalar).unwrap();
+            let filtered = filter_record_batch(&batch, &mask).unwrap();
+            filtered_rows += filtered.num_rows();
+            if filtered.num_rows() > 0 {
+                println!(
+                    "batch filtered {}/{} rows for attrelid={FILTER_ATTRELID}",
+                    filtered.num_rows(),
+                    batch.num_rows()
+                );
+                let attname_col = filtered
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("col 1 should be StringArray");
+                for i in 0..attname_col.len() {
+                    println!("  attname[{i}] = {:?}", attname_col.value(i));
+                }
+            }
         }
+        println!(
+            "total_rows={total_rows}, filtered_rows={filtered_rows} (attrelid={FILTER_ATTRELID})"
+        );
 
         assert!(count > 0, "stream should yield at least one batch");
         assert!(total_rows > 0, "stream should yield at least one row");
@@ -672,20 +712,18 @@ mod tests {
 
     #[test]
     fn test_batch_stream_matches_read_all() {
-        let schema = PgClass::catalog_schema();
+        let schema = PgAttribute::catalog_schema();
 
         // Collect via stream.
-        let reader1 = TableFileReader::new(16384, PgClass::RELATION_OID as usize);
+        let reader1 = TableFileReader::new(16727, PgAttribute::RELATION_OID as usize);
         let stream = reader1
             .get_page_reader()
             .unwrap()
             .into_batch_stream(&schema, None);
-        let stream_rows: usize = stream
-            .map(|r| r.unwrap().num_rows())
-            .sum();
+        let stream_rows: usize = stream.map(|r| r.unwrap().num_rows()).sum();
 
         // Collect via read_all.
-        let reader2 = TableFileReader::new(16384, PgClass::RELATION_OID as usize);
+        let reader2 = TableFileReader::new(16727, PgAttribute::RELATION_OID as usize);
         let all_batches = reader2
             .get_page_reader()
             .unwrap()
@@ -696,6 +734,40 @@ mod tests {
         assert_eq!(
             stream_rows, all_rows,
             "stream and read_all should yield the same total rows"
+        );
+    }
+
+    #[test]
+    fn test_page_row_iter_count_matches_batches() {
+        let schema = PgAttribute::catalog_schema();
+
+        // Count rows via raw HeapTupleData iterator.
+        let reader1 = TableFileReader::new(16727, PgAttribute::RELATION_OID as usize);
+        let row_iter_count: usize = reader1
+            .get_page_reader()
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .count();
+
+        // Count rows via Arrow batch path.
+        let reader2 = TableFileReader::new(16727, PgAttribute::RELATION_OID as usize);
+        let batch_row_count: usize = reader2
+            .get_page_reader()
+            .unwrap()
+            .read_all_to_batches(&schema, None)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+
+        assert!(
+            row_iter_count > 0,
+            "row iterator should yield at least one row"
+        );
+        assert_eq!(
+            row_iter_count, batch_row_count,
+            "raw row iterator and Arrow batch path should yield the same total rows"
         );
     }
 }
