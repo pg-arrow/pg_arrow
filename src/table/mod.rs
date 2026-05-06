@@ -964,7 +964,9 @@ impl ColumnBuilder {
                 Ok(())
             }
             Self::Date(b) => {
-                b.append_value(i32::from_ne_bytes(bytes[..4].try_into().unwrap()));
+                // PG date: days since 2000-01-01; Arrow Date32: days since 1970-01-01
+                let pg_days = i32::from_ne_bytes(bytes[..4].try_into().unwrap());
+                b.append_value(pg_days + 10957);
                 Ok(())
             }
             Self::Money(b) => {
@@ -976,11 +978,15 @@ impl ColumnBuilder {
                 Ok(())
             }
             Self::Timestamp(b) => {
-                b.append_value(i64::from_ne_bytes(bytes[..8].try_into().unwrap()));
+                // PG timestamp: µs since 2000-01-01; Arrow Timestamp(µs): µs since 1970-01-01
+                let pg_us = i64::from_ne_bytes(bytes[..8].try_into().unwrap());
+                b.append_value(pg_us + 946_684_800_000_000);
                 Ok(())
             }
             Self::TimestampTz(b) => {
-                b.append_value(i64::from_ne_bytes(bytes[..8].try_into().unwrap()));
+                // PG timestamptz: µs since 2000-01-01 UTC; Arrow TimestampTz(µs): µs since 1970-01-01 UTC
+                let pg_us = i64::from_ne_bytes(bytes[..8].try_into().unwrap());
+                b.append_value(pg_us + 946_684_800_000_000);
                 Ok(())
             }
             Self::Timetz(b) => {
