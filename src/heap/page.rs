@@ -459,6 +459,7 @@ mod tests {
 
     use crate::file::reader::TableFileReader;
     use crate::types::{PgAttribute, PgCatalogRelation, PgClass};
+    use crate::util::pg_harness;
 
     #[test]
     fn test_page_to_record_batch_all_columns() {
@@ -657,7 +658,8 @@ mod tests {
     #[test]
     fn test_batch_stream_yields_incrementally() {
         let schema = PgAttribute::catalog_schema();
-        let reader = TableFileReader::new(16727, PgAttribute::RELATION_OID as usize);
+        let db_id = pg_harness::db_oid_blocking("postgres");
+        let reader = TableFileReader::new(db_id, PgAttribute::RELATION_OID as usize);
         let page_reader = reader.get_page_reader().unwrap();
 
         // Use a small batch size to force multiple fill_buffer rounds.
@@ -713,9 +715,10 @@ mod tests {
     #[test]
     fn test_batch_stream_matches_read_all() {
         let schema = PgAttribute::catalog_schema();
+        let db_id = pg_harness::db_oid_blocking("postgres");
 
         // Collect via stream.
-        let reader1 = TableFileReader::new(16727, PgAttribute::RELATION_OID as usize);
+        let reader1 = TableFileReader::new(db_id, PgAttribute::RELATION_OID as usize);
         let stream = reader1
             .get_page_reader()
             .unwrap()
@@ -723,7 +726,7 @@ mod tests {
         let stream_rows: usize = stream.map(|r| r.unwrap().num_rows()).sum();
 
         // Collect via read_all.
-        let reader2 = TableFileReader::new(16727, PgAttribute::RELATION_OID as usize);
+        let reader2 = TableFileReader::new(db_id, PgAttribute::RELATION_OID as usize);
         let all_batches = reader2
             .get_page_reader()
             .unwrap()
@@ -740,9 +743,10 @@ mod tests {
     #[test]
     fn test_page_row_iter_count_matches_batches() {
         let schema = PgAttribute::catalog_schema();
+        let db_id = pg_harness::db_oid_blocking("postgres");
 
         // Count rows via raw HeapTupleData iterator.
-        let reader1 = TableFileReader::new(16727, PgAttribute::RELATION_OID as usize);
+        let reader1 = TableFileReader::new(db_id, PgAttribute::RELATION_OID as usize);
         let row_iter_count: usize = reader1
             .get_page_reader()
             .unwrap()
@@ -751,7 +755,7 @@ mod tests {
             .count();
 
         // Count rows via Arrow batch path.
-        let reader2 = TableFileReader::new(16727, PgAttribute::RELATION_OID as usize);
+        let reader2 = TableFileReader::new(db_id, PgAttribute::RELATION_OID as usize);
         let batch_row_count: usize = reader2
             .get_page_reader()
             .unwrap()

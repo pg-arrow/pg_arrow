@@ -20,6 +20,7 @@ bytes = "1"
 [dev-dependencies]
 criterion = "0.8"
 iai = "0.1"
+pg-test-harness = { path = "../utilities/pg-test-harness" }
 
 [[bench]]
 name = "criterion_bench"

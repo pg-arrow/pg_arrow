@@ -1335,6 +1335,100 @@ pub fn decode_row_projected(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::PgDatum;
+    use crate::util::pg_harness;
+
+    /// High-level SELECT * validation: PgTableReader rows match live PostgreSQL output.
+    ///
+    /// Checks that `fetch_all()` + `to_record_batch()` returns the same row count
+    /// and same values for id/text columns as a plain `SELECT * FROM decode_test ORDER BY id`.
+    #[test]
+    fn test_table_reader_select_matches_postgres() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // ── 1. Live PG ────────────────────────────────────────────────────
+            let client = pg_harness::connect().await;
+            pg_harness::ensure_decode_test_table(&client).await;
+
+            let pg_rows = client
+                .query(
+                    &format!(
+                        "SELECT id, col_int4, col_text FROM {} ORDER BY id",
+                        pg_harness::DECODE_TEST_TABLE
+                    ),
+                    &[],
+                )
+                .await
+                .expect("SELECT failed");
+
+            // ── 2. pgfusion ───────────────────────────────────────────────────
+            let db_id = pg_harness::db_oid(&client, "postgres").await;
+            let mut reader = PgTableReader::new(db_id).unwrap();
+            reader
+                .set_table(pg_harness::DECODE_TEST_TABLE)
+                .expect("decode test table not found");
+
+            let mut rows = reader.fetch_all().expect("fetch_all failed");
+
+            let schema = reader.schema().unwrap().clone();
+            let col_id = schema
+                .columns()
+                .enumerate()
+                .find(|(_, c)| c.name == "id")
+                .map(|(i, _)| i)
+                .unwrap();
+            let col_int4 = schema
+                .columns()
+                .enumerate()
+                .find(|(_, c)| c.name == "col_int4")
+                .map(|(i, _)| i)
+                .unwrap();
+            let col_text = schema
+                .columns()
+                .enumerate()
+                .find(|(_, c)| c.name == "col_text")
+                .map(|(i, _)| i)
+                .unwrap();
+
+            rows.sort_by_key(|row| match row.get(col_id) {
+                Some(PgDatum::Int4(id)) => *id,
+                _ => i32::MAX,
+            });
+
+            assert_eq!(
+                rows.len(),
+                pg_rows.len(),
+                "row count mismatch: pgfusion={} pg={}",
+                rows.len(),
+                pg_rows.len()
+            );
+
+            for (i, (decoded, pg)) in rows.iter().zip(pg_rows.iter()).enumerate() {
+                let want_id: i32 = pg.get("id");
+                let got_id = match decoded.get(col_id) {
+                    Some(PgDatum::Int4(v)) => *v,
+                    other => panic!("row {i}: id unexpected {other:?}"),
+                };
+                assert_eq!(got_id, want_id, "row {i}: id");
+
+                let want_int4: Option<i32> = pg.get("col_int4");
+                let got_int4 = match decoded.get(col_int4) {
+                    Some(PgDatum::Int4(v)) => Some(*v),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("row {i}: col_int4 unexpected {other:?}"),
+                };
+                assert_eq!(got_int4, want_int4, "row {i}: col_int4");
+
+                let want_text: Option<String> = pg.get("col_text");
+                let got_text = match decoded.get(col_text) {
+                    Some(PgDatum::Text(v)) => Some(v.clone()),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("row {i}: col_text unexpected {other:?}"),
+                };
+                assert_eq!(got_text, want_text, "row {i}: col_text");
+            }
+        });
+    }
 
     #[test]
     fn test_table_reader_bootstrap() {

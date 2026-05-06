@@ -61,6 +61,7 @@ mod tests {
     use crate::types::PgAttribute;
     use crate::types::PgCatalogRelation;
     use crate::types::PgClass;
+    use crate::util::pg_harness;
 
     use super::*;
 
@@ -163,7 +164,7 @@ mod tests {
 
         use crate::types::PgSchema;
 
-        let db_id = 16727usize;
+        let db_id = pg_harness::db_oid_blocking("postgres");
         let target_table_name = "hits";
 
         // ── Step 1: Scan pg_class to find a user table ─────────────────────

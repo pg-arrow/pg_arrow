@@ -515,3 +515,197 @@ pub struct PgAttInfo {
 pub fn align_to(offset: usize, align: usize) -> usize {
     (offset + align - 1) & !(align - 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::codec::PgDatum;
+    use crate::table::PgTableReader;
+    use crate::util::pg_harness;
+
+
+    /// Decode validation: scan the decode test table via raw HeapTupleData iteration,
+    /// decode each column via `get_column`, and compare against live PostgreSQL results.
+    ///
+    /// This validates that our low-level tuple decoder produces the same values as
+    /// the authoritative source (PostgreSQL itself) for all basic types.
+    #[test]
+    fn test_decode_columns_match_live_postgres() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // ── 1. Connect to live PG and ensure the decode test table exists ──
+            let client = pg_harness::connect().await;
+            pg_harness::ensure_decode_test_table(&client).await;
+
+            // ── 2. Read expected values from live PostgreSQL ───────────────────
+            let pg_rows = client
+                .query(
+                    &format!(
+                        "SELECT id, col_bool, col_int2, col_int4, col_int8,
+                                col_float4, col_float8, col_text, col_bytea,
+                                col_date::text, col_ts::text,
+                                (col_tstz AT TIME ZONE 'UTC')::text as col_tstz_utc
+                         FROM {} ORDER BY id",
+                        pg_harness::DECODE_TEST_TABLE
+                    ),
+                    &[],
+                )
+                .await
+                .expect("SELECT failed");
+
+            assert!(!pg_rows.is_empty(), "decode test table should have rows");
+
+            // ── 3. Read the same table via PgTableReader ──────────────────────
+            let db_id = pg_harness::db_oid(&client, "postgres").await;
+            let mut reader = PgTableReader::new(db_id).unwrap();
+            reader
+                .set_table(pg_harness::DECODE_TEST_TABLE)
+                .expect("table not found — was setup run?");
+
+            let decoded_rows = reader
+                .fetch_all()
+                .expect("failed to read decode test table");
+
+            let schema = reader.schema().unwrap().clone();
+
+            // Sort decoded rows by id (col index 0 = serial id).
+            let mut decoded_rows = decoded_rows;
+            decoded_rows.sort_by_key(|row| match row.get(0) {
+                Some(PgDatum::Int4(id)) => *id,
+                _ => i32::MAX,
+            });
+
+            assert_eq!(
+                decoded_rows.len(),
+                pg_rows.len(),
+                "row count mismatch: pgfusion={} pg={}",
+                decoded_rows.len(),
+                pg_rows.len()
+            );
+
+            // Column name → schema index helper.
+            let col_idx = |name: &str| -> usize {
+                schema
+                    .columns()
+                    .enumerate()
+                    .find(|(_, c)| c.name == name)
+                    .map(|(i, _)| i)
+                    .unwrap_or_else(|| panic!("column {name} not found in schema"))
+            };
+
+            let idx_bool = col_idx("col_bool");
+            let idx_int2 = col_idx("col_int2");
+            let idx_int4 = col_idx("col_int4");
+            let idx_int8 = col_idx("col_int8");
+            let idx_float4 = col_idx("col_float4");
+            let idx_float8 = col_idx("col_float8");
+            let idx_text = col_idx("col_text");
+            let idx_bytea = col_idx("col_bytea");
+            let idx_date = col_idx("col_date");
+            let idx_ts = col_idx("col_ts");
+            let idx_tstz = col_idx("col_tstz");
+
+            for (i, (decoded, pg)) in decoded_rows.iter().zip(pg_rows.iter()).enumerate() {
+                let label = format!("row {i}");
+
+                // col_bool
+                let want_bool = pg_harness::pg_bool(pg, "col_bool");
+                let got_bool = match decoded.get(idx_bool) {
+                    Some(PgDatum::Bool(v)) => Some(*v),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_bool unexpected datum {other:?}"),
+                };
+                assert_eq!(got_bool, want_bool, "{label}: col_bool");
+
+                // col_int2
+                let want_int2 = pg_harness::pg_i16(pg, "col_int2");
+                let got_int2 = match decoded.get(idx_int2) {
+                    Some(PgDatum::Int2(v)) => Some(*v),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_int2 unexpected datum {other:?}"),
+                };
+                assert_eq!(got_int2, want_int2, "{label}: col_int2");
+
+                // col_int4
+                let want_int4 = pg_harness::pg_i32(pg, "col_int4");
+                let got_int4 = match decoded.get(idx_int4) {
+                    Some(PgDatum::Int4(v)) => Some(*v),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_int4 unexpected datum {other:?}"),
+                };
+                assert_eq!(got_int4, want_int4, "{label}: col_int4");
+
+                // col_int8
+                let want_int8 = pg_harness::pg_i64(pg, "col_int8");
+                let got_int8 = match decoded.get(idx_int8) {
+                    Some(PgDatum::Int8(v)) => Some(*v),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_int8 unexpected datum {other:?}"),
+                };
+                assert_eq!(got_int8, want_int8, "{label}: col_int8");
+
+                // col_float4
+                let want_f4 = pg_harness::pg_f32(pg, "col_float4");
+                let got_f4 = match decoded.get(idx_float4) {
+                    Some(PgDatum::Float4(v)) => Some(*v),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_float4 unexpected datum {other:?}"),
+                };
+                assert_eq!(got_f4, want_f4, "{label}: col_float4");
+
+                // col_float8
+                let want_f8 = pg_harness::pg_f64(pg, "col_float8");
+                let got_f8 = match decoded.get(idx_float8) {
+                    Some(PgDatum::Float8(v)) => Some(*v),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_float8 unexpected datum {other:?}"),
+                };
+                assert_eq!(got_f8, want_f8, "{label}: col_float8");
+
+                // col_text
+                let want_text = pg_harness::pg_str(pg, "col_text");
+                let got_text = match decoded.get(idx_text) {
+                    Some(PgDatum::Text(v)) => Some(v.clone()),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_text unexpected datum {other:?}"),
+                };
+                assert_eq!(got_text, want_text, "{label}: col_text");
+
+                // col_bytea
+                let want_bytea = pg_harness::pg_bytes(pg, "col_bytea");
+                let got_bytea = match decoded.get(idx_bytea) {
+                    Some(PgDatum::Bytea(v)) => Some(v.clone()),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_bytea unexpected datum {other:?}"),
+                };
+                assert_eq!(got_bytea, want_bytea, "{label}: col_bytea");
+
+                // col_date — compare as days since 1970-01-01
+                let want_date = pg_harness::pg_date_days(pg, "col_date");
+                let got_date = match decoded.get(idx_date) {
+                    Some(PgDatum::Date(v)) => Some(*v + 10957),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_date unexpected datum {other:?}"),
+                };
+                assert_eq!(got_date, want_date, "{label}: col_date");
+
+                // col_ts — compare as µs since 1970-01-01
+                let want_ts = pg_harness::pg_ts_us(pg, "col_ts");
+                let got_ts = match decoded.get(idx_ts) {
+                    Some(PgDatum::Timestamp(v)) => Some(*v + 946_684_800_000_000),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_ts unexpected datum {other:?}"),
+                };
+                assert_eq!(got_ts, want_ts, "{label}: col_ts");
+
+                // col_tstz
+                let want_tstz = pg_harness::pg_ts_us(pg, "col_tstz_utc");
+                let got_tstz = match decoded.get(idx_tstz) {
+                    Some(PgDatum::TimestampTz(v)) => Some(*v + 946_684_800_000_000),
+                    Some(PgDatum::Null) | None => None,
+                    other => panic!("{label}: col_tstz unexpected datum {other:?}"),
+                };
+                assert_eq!(got_tstz, want_tstz, "{label}: col_tstz");
+            }
+        });
+    }
+}
