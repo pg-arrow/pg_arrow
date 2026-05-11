@@ -3,7 +3,7 @@ pub mod pg_type;
 pub use pg_type::{PgAttribute, PgClass, PgProc, PgType};
 
 use crate::codec::PgTypeId;
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 
 /// Trait for PostgreSQL system catalog relations.
 ///
@@ -33,7 +33,7 @@ pub trait PgCatalogRelation {
         let columns = Self::attr_names()
             .iter()
             .zip(Self::attr_types().iter())
-            .map(|(name, type_id)| PgColumn::new(*name, *type_id, true))
+            .map(|(name, type_id)| PgColumn::new(*name, *type_id, true, -1))
             .collect();
         PgSchema::new(Self::catalog_name(), columns)
     }
@@ -49,21 +49,54 @@ pub struct PgColumn {
     pub type_id: PgTypeId,
     /// Whether the column allows NULLs (inverse of pg_attribute.attnotnull)
     pub nullable: bool,
+    /// Type modifier (atttypmod): encodes precision/scale for NUMERIC, length for VARCHAR, etc.
+    /// -1 means "no modifier" (unbound/unspecified).
+    pub typmod: i32,
 }
 
 impl PgColumn {
     /// Create a new column descriptor.
-    pub fn new(name: impl Into<String>, type_id: PgTypeId, nullable: bool) -> Self {
+    pub fn new(name: impl Into<String>, type_id: PgTypeId, nullable: bool, typmod: i32) -> Self {
         Self {
             name: name.into(),
             type_id,
             nullable,
+            typmod,
         }
     }
 
     /// Convert to an Arrow `Field`.
     pub fn to_arrow_field(&self) -> Field {
-        Field::new(&self.name, self.type_id.arrow_type(), self.nullable)
+        let dt = if self.type_id == PgTypeId::Numeric {
+            numeric_typmod_to_arrow_type(self.typmod)
+        } else {
+            self.type_id.arrow_type()
+        };
+        Field::new(&self.name, dt, self.nullable)
+    }
+}
+
+/// Decode a PostgreSQL NUMERIC typmod into an Arrow decimal type.
+///
+/// PostgreSQL encodes `NUMERIC(precision, scale)` as `((precision << 16) | scale) + VARHDRSZ`
+/// where `VARHDRSZ = 4`. Unbound NUMERIC has typmod `-1`.
+///
+/// - precision ≤ 38 → `Decimal128(precision, scale)`
+/// - precision > 38 or unbound → `Decimal256(precision, scale)` with defaults `(38, 0)`
+pub fn numeric_typmod_to_arrow_type(typmod: i32) -> DataType {
+    if typmod > 0 {
+        // ((precision << 16) | scale) + 4
+        let tm = (typmod - 4) as u32;
+        let precision = (tm >> 16) as u8;
+        let scale = (tm & 0xFFFF) as i8;
+        if precision <= 38 {
+            DataType::Decimal128(precision, scale)
+        } else {
+            DataType::Decimal256(precision, scale)
+        }
+    } else {
+        // Unbound NUMERIC — use Decimal256 with widest safe default
+        DataType::Decimal256(38, 0)
     }
 }
 
@@ -80,6 +113,7 @@ impl From<&PgAttribute> for PgColumn {
             name: attr.attname.to_owned(),
             type_id,
             nullable: !attr.attnotnull,
+            typmod: attr.atttypmod,
         }
     }
 }

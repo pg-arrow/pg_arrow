@@ -2,16 +2,19 @@ use std::ffi::CStr;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder,
-    Float64Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder, UInt8Builder, UInt32Builder,
-    UInt64Builder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Decimal256Builder,
+    FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+    Int64Builder, StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    UInt8Builder, UInt32Builder, UInt64Builder,
 };
+use arrow::datatypes::DataType;
+use arrow::datatypes::i256;
 use arrow::record_batch::RecordBatch;
 
 use crate::codec::{PgDatum, PgTypeId, PgTypeLen, read_varlena_header};
 use crate::file::error::{PgError, Result};
 use crate::file::reader::{Oid, TableFileReader};
+use crate::types::numeric_typmod_to_arrow_type;
 
 use crate::heap::tuple::ColumnSearchArg;
 use crate::types::{PgAttribute, PgCatalogRelation, PgClass, PgSchema};
@@ -69,7 +72,7 @@ impl PgRow {
                     column: format!("index {col_idx}"),
                 })?;
 
-            let array = build_arrow_array(col.type_id, rows, col_idx, num_rows)?;
+            let array = build_arrow_array(col.type_id, col.typmod, rows, col_idx, num_rows)?;
             columns.push(array);
         }
 
@@ -353,6 +356,7 @@ impl PgTableReader {
 /// than `col_idx` are treated as NULL.
 fn build_arrow_array(
     type_id: PgTypeId,
+    typmod: i32,
     rows: &[PgRow],
     col_idx: usize,
     num_rows: usize,
@@ -510,8 +514,7 @@ fn build_arrow_array(
         | PgTypeId::Varchar
         | PgTypeId::Bpchar
         | PgTypeId::Json
-        | PgTypeId::Xml
-        | PgTypeId::Numeric => {
+        | PgTypeId::Xml => {
             let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
             for row in rows {
                 match row.get(col_idx) {
@@ -522,18 +525,6 @@ fn build_arrow_array(
                         | PgDatum::Json(s)
                         | PgDatum::Xml(s),
                     ) => builder.append_value(s),
-                    Some(PgDatum::Numeric(b)) => {
-                        // Numeric is stored as raw bytes but mapped to Utf8;
-                        // best-effort: represent as hex if not valid UTF-8
-                        match std::str::from_utf8(b) {
-                            Ok(s) => builder.append_value(s),
-                            Err(_) => {
-                                let hex: String =
-                                    b.iter().map(|byte| format!("{byte:02x}")).collect();
-                                builder.append_value(&hex);
-                            }
-                        }
-                    }
                     Some(PgDatum::Null) | None => builder.append_null(),
                     Some(other) => {
                         return Err(PgError::ArrowConversionFailed {
@@ -545,6 +536,80 @@ fn build_arrow_array(
                 }
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+
+        // ── NUMERIC → Decimal ───────────────────────────────────────────
+        PgTypeId::Numeric => {
+            let arrow_type = numeric_typmod_to_arrow_type(typmod);
+            match arrow_type {
+                DataType::Decimal128(p, s) => {
+                    let mut builder = Decimal128Builder::with_capacity(num_rows)
+                        .with_data_type(DataType::Decimal128(p, s));
+                    for row in rows {
+                        match row.get(col_idx) {
+                            Some(PgDatum::Numeric(b)) => match decode_pg_numeric_i128(b) {
+                                None => builder.append_null(),
+                                Some((mut val, actual_scale)) => {
+                                    let diff = s - actual_scale;
+                                    if diff > 0 {
+                                        val = val.saturating_mul(10_i128.pow(diff as u32));
+                                    } else if diff < 0 {
+                                        val /= 10_i128.pow((-diff) as u32);
+                                    }
+                                    builder.append_value(val);
+                                }
+                            },
+                            Some(PgDatum::Null) | None => builder.append_null(),
+                            Some(other) => {
+                                return Err(PgError::ArrowConversionFailed {
+                                    detail: format!(
+                                        "column {col_idx}: expected Numeric, got {other:?}"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()) as ArrayRef)
+                }
+                _ => {
+                    // Decimal256 or unbound
+                    let (p, s) = match &arrow_type {
+                        DataType::Decimal256(p, s) => (*p, *s),
+                        _ => (38, 0),
+                    };
+                    let mut builder = Decimal256Builder::with_capacity(num_rows)
+                        .with_data_type(DataType::Decimal256(p, s));
+                    for row in rows {
+                        match row.get(col_idx) {
+                            Some(PgDatum::Numeric(b)) => match decode_pg_numeric_i256(b) {
+                                None => builder.append_null(),
+                                Some((mut val, actual_scale)) => {
+                                    let diff = s - actual_scale;
+                                    if diff > 0 {
+                                        val = val.wrapping_mul(i256::from_i128(
+                                            10_i128.pow(diff as u32),
+                                        ));
+                                    } else if diff < 0 {
+                                        val = val.wrapping_div(i256::from_i128(
+                                            10_i128.pow((-diff) as u32),
+                                        ));
+                                    }
+                                    builder.append_value(val);
+                                }
+                            },
+                            Some(PgDatum::Null) | None => builder.append_null(),
+                            Some(other) => {
+                                return Err(PgError::ArrowConversionFailed {
+                                    detail: format!(
+                                        "column {col_idx}: expected Numeric, got {other:?}"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()) as ArrayRef)
+                }
+            }
         }
         PgTypeId::Name => {
             let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 64);
@@ -796,6 +861,139 @@ fn build_fixed_binary(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// PostgreSQL numeric binary → i128 / i256
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Each PostgreSQL numeric digit is base 10000.
+const NBASE: i128 = 10_000;
+
+// NumericShort header bit masks
+const NUMERIC_SHORT_FLAG: u16 = 0x8000;
+const NUMERIC_SPECIAL_FLAG: u16 = 0xC000;
+const NUMERIC_SIGN_MASK: u16 = 0xC000;
+const NUMERIC_SHORT_SIGN_MASK: u16 = 0x2000;
+const NUMERIC_SHORT_DSCALE_MASK: u16 = 0x1F80;
+const NUMERIC_SHORT_DSCALE_SHIFT: u16 = 7;
+const NUMERIC_SHORT_WEIGHT_SIGN_MASK: u16 = 0x0040;
+const NUMERIC_SHORT_WEIGHT_MASK: u16 = 0x003F;
+// NumericLong sign values (high two bits of n_sign_dscale)
+const NUMERIC_NEG_FLAG: u16 = 0x4000;
+const NUMERIC_DSCALE_MASK: u16 = 0x3FFF;
+
+/// Parse the PostgreSQL on-disk numeric varlena payload.
+///
+/// The payload (varlena header already stripped) begins with `NumericChoice`:
+/// - **Short form** (`header & 0x8000 != 0`, but `header & 0xC000 != 0xC000`):
+///   2-byte header only; sign/dscale/weight packed into `n_header`.
+/// - **Long form** (`header & 0xC000 == 0x0000` or `0x4000`):
+///   4-byte header: `n_sign_dscale` (u16) + `n_weight` (i16).
+/// - **Special** (`header & 0xC000 == 0xC000`): NaN or Infinity → None.
+///
+/// Returns `(digits_slice, ndigits, weight, dscale, is_negative)`.
+fn parse_numeric_header(bytes: &[u8]) -> Option<(&[u8], i32, i32, i32, bool)> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    let header = u16::from_ne_bytes(bytes[0..2].try_into().ok()?);
+
+    if header & NUMERIC_SIGN_MASK == NUMERIC_SPECIAL_FLAG {
+        // NaN or Infinity
+        return None;
+    }
+
+    if header & NUMERIC_SHORT_FLAG != 0 {
+        // Short format: 2-byte header
+        let is_neg = (header & NUMERIC_SHORT_SIGN_MASK) != 0;
+        let dscale = ((header & NUMERIC_SHORT_DSCALE_MASK) >> NUMERIC_SHORT_DSCALE_SHIFT) as i32;
+        let weight_raw = (header & NUMERIC_SHORT_WEIGHT_MASK) as i32;
+        let weight = if header & NUMERIC_SHORT_WEIGHT_SIGN_MASK != 0 {
+            weight_raw | !( NUMERIC_SHORT_WEIGHT_MASK as i32)
+        } else {
+            weight_raw
+        };
+        let digits = &bytes[2..];
+        let ndigits = digits.len() as i32 / 2;
+        Some((digits, ndigits, weight, dscale, is_neg))
+    } else {
+        // Long format: 4-byte header
+        if bytes.len() < 4 {
+            return None;
+        }
+        let sign_dscale = u16::from_ne_bytes(bytes[0..2].try_into().ok()?);
+        let weight = i16::from_ne_bytes(bytes[2..4].try_into().ok()?) as i32;
+        let is_neg = (sign_dscale & NUMERIC_SIGN_MASK) == NUMERIC_NEG_FLAG;
+        let dscale = (sign_dscale & NUMERIC_DSCALE_MASK) as i32;
+        let digits = &bytes[4..];
+        let ndigits = digits.len() as i32 / 2;
+        Some((digits, ndigits, weight, dscale, is_neg))
+    }
+}
+
+/// Decode a PostgreSQL on-disk numeric varlena payload into a scaled i128.
+///
+/// Returns `(value, scale)` where `value * 10^-scale` represents the number,
+/// or `None` for NaN / ±Inf.
+pub fn decode_pg_numeric_i128(bytes: &[u8]) -> Option<(i128, i8)> {
+    let (digits, ndigits, weight, dscale, is_neg) = parse_numeric_header(bytes)?;
+
+    if ndigits == 0 {
+        return Some((0, dscale as i8));
+    }
+
+    let mut value: i128 = 0;
+    for i in 0..ndigits as usize {
+        let d = i16::from_ne_bytes(digits[i * 2..i * 2 + 2].try_into().ok()?) as i128;
+        value = value * NBASE + d;
+    }
+
+    // value is an integer with (ndigits-1-weight)*4 implicit decimal places.
+    // Adjust to dscale.
+    let natural_scale = (ndigits - 1 - weight) * 4;
+    let diff = dscale - natural_scale;
+    if diff > 0 {
+        value = value.saturating_mul(10_i128.pow(diff as u32));
+    } else if diff < 0 {
+        value /= 10_i128.pow((-diff) as u32);
+    }
+
+    if is_neg {
+        value = -value;
+    }
+
+    Some((value, dscale as i8))
+}
+
+/// Decode a PostgreSQL on-disk numeric varlena payload into a scaled i256.
+pub fn decode_pg_numeric_i256(bytes: &[u8]) -> Option<(i256, i8)> {
+    let (digits, ndigits, weight, dscale, is_neg) = parse_numeric_header(bytes)?;
+
+    if ndigits == 0 {
+        return Some((i256::ZERO, dscale as i8));
+    }
+
+    let nbase256 = i256::from_i128(NBASE);
+    let mut value = i256::ZERO;
+    for i in 0..ndigits as usize {
+        let d = i16::from_ne_bytes(digits[i * 2..i * 2 + 2].try_into().ok()?) as i128;
+        value = value.wrapping_mul(nbase256).wrapping_add(i256::from_i128(d));
+    }
+
+    let natural_scale = (ndigits - 1 - weight) * 4;
+    let diff = dscale - natural_scale;
+    if diff > 0 {
+        value = value.wrapping_mul(i256::from_i128(10_i128.pow(diff as u32)));
+    } else if diff < 0 {
+        value = value.wrapping_div(i256::from_i128(10_i128.pow((-diff) as u32)));
+    }
+
+    if is_neg {
+        value = value.wrapping_neg();
+    }
+
+    Some((value, dscale as i8))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // ColumnBuilder — zero-copy bytes → Arrow path
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -829,11 +1027,25 @@ pub enum ColumnBuilder {
     Binary(BinaryBuilder),
     FixedBinary(FixedSizeBinaryBuilder),
     Tid(BinaryBuilder),
+    /// NUMERIC with precision ≤ 38 — scale stored for decode alignment
+    Decimal128(Decimal128Builder, i8),
+    /// NUMERIC with precision > 38 or unbound — scale stored for decode alignment
+    Decimal256(Decimal256Builder, i8),
 }
 
 impl ColumnBuilder {
     /// Create a builder for the given PostgreSQL type, pre-allocated for `capacity` rows.
+    /// For NUMERIC columns, use [`ColumnBuilder::for_column`] to preserve typmod.
     pub fn new(type_id: PgTypeId, capacity: usize) -> Self {
+        Self::new_inner(type_id, -1, capacity)
+    }
+
+    /// Create a builder from a full `PgColumn` descriptor, preserving typmod for NUMERIC.
+    pub fn for_column(col: &crate::types::PgColumn, capacity: usize) -> Self {
+        Self::new_inner(col.type_id, col.typmod, capacity)
+    }
+
+    fn new_inner(type_id: PgTypeId, typmod: i32, capacity: usize) -> Self {
         match type_id {
             PgTypeId::Bool => Self::Bool(BooleanBuilder::with_capacity(capacity)),
             PgTypeId::Int2 => Self::Int2(Int16Builder::with_capacity(capacity)),
@@ -865,9 +1077,24 @@ impl ColumnBuilder {
             | PgTypeId::Varchar
             | PgTypeId::Bpchar
             | PgTypeId::Json
-            | PgTypeId::Xml
-            | PgTypeId::Numeric => {
+            | PgTypeId::Xml => {
                 Self::Utf8(StringBuilder::with_capacity(capacity, capacity * 32))
+            }
+            PgTypeId::Numeric => {
+                let arrow_type = numeric_typmod_to_arrow_type(typmod);
+                match arrow_type {
+                    DataType::Decimal128(p, s) => {
+                        let builder = Decimal128Builder::with_capacity(capacity)
+                            .with_data_type(DataType::Decimal128(p, s));
+                        Self::Decimal128(builder, s)
+                    }
+                    DataType::Decimal256(p, s) => {
+                        let builder = Decimal256Builder::with_capacity(capacity)
+                            .with_data_type(DataType::Decimal256(p, s));
+                        Self::Decimal256(builder, s)
+                    }
+                    _ => unreachable!(),
+                }
             }
             // Fixed-size binary: UUID(16), MacAddr(6), MacAddr8(8), Point(16), Line(24),
             // Circle(24), Lseg(32), Box(32)
@@ -917,6 +1144,8 @@ impl ColumnBuilder {
             Self::Binary(b) => b.append_null(),
             Self::FixedBinary(b) => b.append_null(),
             Self::Tid(b) => b.append_null(),
+            Self::Decimal128(b, _) => b.append_null(),
+            Self::Decimal256(b, _) => b.append_null(),
         }
     }
 
@@ -1013,12 +1242,40 @@ impl ColumnBuilder {
                 Ok(())
             }
             Self::Utf8(b) => {
-                // Varlena payload — already UTF-8 text or numeric-as-hex
                 match std::str::from_utf8(bytes) {
                     Ok(s) => b.append_value(s),
-                    Err(_) => {
-                        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-                        b.append_value(&hex);
+                    Err(_) => b.append_null(),
+                }
+                Ok(())
+            }
+            Self::Decimal128(b, target_scale) => {
+                let target_scale = *target_scale;
+                match decode_pg_numeric_i128(bytes) {
+                    None => b.append_null(),
+                    Some((mut val, actual_scale)) => {
+                        let diff = target_scale - actual_scale;
+                        if diff > 0 {
+                            val = val.saturating_mul(10_i128.pow(diff as u32));
+                        } else if diff < 0 {
+                            val /= 10_i128.pow((-diff) as u32);
+                        }
+                        b.append_value(val);
+                    }
+                }
+                Ok(())
+            }
+            Self::Decimal256(b, target_scale) => {
+                let target_scale = *target_scale;
+                match decode_pg_numeric_i256(bytes) {
+                    None => b.append_null(),
+                    Some((mut val, actual_scale)) => {
+                        let diff = target_scale - actual_scale;
+                        if diff > 0 {
+                            val = val.wrapping_mul(i256::from_i128(10_i128.pow(diff as u32)));
+                        } else if diff < 0 {
+                            val = val.wrapping_div(i256::from_i128(10_i128.pow((-diff) as u32)));
+                        }
+                        b.append_value(val);
                     }
                 }
                 Ok(())
@@ -1074,6 +1331,8 @@ impl ColumnBuilder {
             Self::Binary(mut b) => Arc::new(b.finish()),
             Self::FixedBinary(mut b) => Arc::new(b.finish()),
             Self::Tid(mut b) => Arc::new(b.finish()),
+            Self::Decimal128(mut b, _) => Arc::new(b.finish()),
+            Self::Decimal256(mut b, _) => Arc::new(b.finish()),
         }
     }
 }

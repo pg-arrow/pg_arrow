@@ -307,12 +307,15 @@ impl HeapPageData {
         match projection {
             Some(proj) => {
                 for &idx in proj {
-                    builders.push(ColumnBuilder::new(type_ids[idx], self.lp_num));
+                    builders.push(ColumnBuilder::for_column(
+                        schema.column(idx).unwrap(),
+                        self.lp_num,
+                    ));
                 }
             }
             None => {
-                for &tid in &type_ids {
-                    builders.push(ColumnBuilder::new(tid, self.lp_num));
+                for col in schema.columns() {
+                    builders.push(ColumnBuilder::for_column(col, self.lp_num));
                 }
             }
         }

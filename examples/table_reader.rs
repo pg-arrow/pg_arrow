@@ -1,10 +1,11 @@
 use pg_arrow::table::PgTableReader;
+use pg_test_harness::db_oid_blocking;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let db_id = 16384;
+    let db_id = db_oid_blocking("postgres");
 
     // Bootstrap: reads pg_class + pg_attribute catalogs
     println!("Bootstrapping catalogs for db_id={db_id}...");
@@ -31,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Fetch with limit
     let rows = reader.fetch_by_limit(5)?;
-    for (i, row) in rows.iter().enumerate() {
+    for (_i, row) in rows.iter().enumerate() {
         println!("{}", row);
     }
 
