@@ -1,4 +1,5 @@
 pub mod page;
+pub mod snapshot;
 pub mod tuple;
 
 pub use page::{

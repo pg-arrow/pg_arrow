@@ -5,6 +5,7 @@ use bytes::Bytes;
 use derive_where::derive_where;
 
 use crate::file::error;
+use crate::heap::snapshot::PgSnapshot;
 use crate::heap::tuple::{HEAP_NATTS_MASK, HeapTupleData, InfoMask, SIZEOF_HEAP_TUPLE_HEADER};
 use crate::types::{ColumnBuilder, PgTypeId, PgTypeLen, extract_column_bytes, extract_fixed_bytes, skip_datum};
 use crate::types::PgSchema;
@@ -230,6 +231,7 @@ impl HeapPageData {
         &self,
         schema: &PgSchema,
         projection: Option<&[usize]>,
+        snapshot: Option<&PgSnapshot>,
     ) -> error::Result<RecordBatch> {
         let num_schema_cols = schema.num_columns();
 
@@ -346,6 +348,22 @@ impl HeapPageData {
 
             if t_hoff < SIZEOF_HEAP_TUPLE_HEADER || t_hoff > raw.len() {
                 continue;
+            }
+
+            // Skip dead tuples: xmax is valid (not flagged XMAX_INVALID) and non-zero.
+            // This filters out old row versions left behind by UPDATE/DELETE before VACUUM.
+            let t_xmin = u32::from_ne_bytes(raw[0..4].try_into().unwrap());
+            let t_xmax = u32::from_ne_bytes(raw[4..8].try_into().unwrap());
+            let xmax_invalid = t_infomask & (InfoMask::XmaxInvalid as u16) != 0;
+            if !xmax_invalid && t_xmax != 0 {
+                continue;
+            }
+
+            // Apply snapshot xmin visibility if a snapshot was provided.
+            if let Some(snap) = snapshot {
+                if !snap.xmin_visible(t_xmin) {
+                    continue;
+                }
             }
 
             // Borrow null bitmap and attribute data directly from page buffer.
@@ -470,7 +488,7 @@ mod tests {
         let mut page_reader = reader.get_page_reader().unwrap();
         let page = page_reader.get_page_by_index(0).unwrap();
 
-        let batch = page.to_record_batch(&schema, None).unwrap();
+        let batch = page.to_record_batch(&schema, None, None).unwrap();
 
         assert!(batch.num_rows() > 0, "pg_class page 0 should have rows");
         assert_eq!(
@@ -500,7 +518,7 @@ mod tests {
 
         // Project only: oid (col 0), relname (col 1), relnamespace (col 2)
         let projection = &[0, 1, 2];
-        let batch = page.to_record_batch(&schema, Some(projection)).unwrap();
+        let batch = page.to_record_batch(&schema, Some(projection), None).unwrap();
 
         assert!(batch.num_rows() > 0);
         assert_eq!(
@@ -532,7 +550,7 @@ mod tests {
         let page = page_reader.get_page_by_index(0).unwrap();
 
         // Project only relname (col 1) — forces skipping col 0 (oid).
-        let batch = page.to_record_batch(&schema, Some(&[1])).unwrap();
+        let batch = page.to_record_batch(&schema, Some(&[1]), None).unwrap();
 
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.schema().field(0).name(), "relname");
@@ -560,7 +578,7 @@ mod tests {
         let mut page_reader = reader.get_page_reader().unwrap();
         let page = page_reader.get_page_by_index(0).unwrap();
 
-        let batch = page.to_record_batch(&schema, Some(&[])).unwrap();
+        let batch = page.to_record_batch(&schema, Some(&[]), None).unwrap();
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(batch.num_rows(), 0);
     }
@@ -615,7 +633,7 @@ mod tests {
         let reader = TableFileReader::new(16384, PgClass::RELATION_OID as usize);
         let mut page_reader = reader.get_page_reader().unwrap();
         let page0 = page_reader.get_page_by_index(0).unwrap();
-        let sequential_batch = page0.to_record_batch(&schema, None).unwrap();
+        let sequential_batch = page0.to_record_batch(&schema, None, None).unwrap();
 
         // Parallel: read all, take first batch.
         let reader2 = TableFileReader::new(16384, PgClass::RELATION_OID as usize);

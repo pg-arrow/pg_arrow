@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::file::error::{PgError, Result};
 use crate::file::page::PAGES_PER_SEGMENT;
 use crate::file::*;
+use crate::heap::snapshot::PgSnapshot;
 
 const PAGE_SIZE: usize = 8192;
 
@@ -311,6 +312,8 @@ pub struct RecordBatchStream<R: ChunkReader> {
     pub(crate) buffer: std::collections::VecDeque<arrow::record_batch::RecordBatch>,
     /// True once we've read past the last page.
     pub(crate) exhausted: bool,
+    /// Optional MVCC snapshot for xmin visibility filtering.
+    pub(crate) snapshot: Option<PgSnapshot>,
 }
 
 impl<R: ChunkReader> RecordBatchStream<R> {
@@ -332,7 +335,13 @@ impl<R: ChunkReader> RecordBatchStream<R> {
             max_page_index: None,
             buffer: std::collections::VecDeque::new(),
             exhausted: false,
+            snapshot: None,
         }
+    }
+
+    pub fn with_snapshot(mut self, snapshot: PgSnapshot) -> Self {
+        self.snapshot = Some(snapshot);
+        self
     }
 
     /// Set the number of pages to read per I/O batch.
@@ -387,7 +396,7 @@ impl<R: ChunkReader> RecordBatchStream<R> {
             let end = start + PAGE_BUFFER_SIZE;
             let page_bytes = bulk_bytes.slice(start..end);
             let page = HeapPageData::parse_bytes(page_bytes)?;
-            let batch = page.to_record_batch(&self.schema, proj_slice);
+            let batch = page.to_record_batch(&self.schema, proj_slice, self.snapshot.as_ref());
             self.buffer.push_back(batch.unwrap());
         }
         self.next_page_index += pages_read;
@@ -441,7 +450,7 @@ fn convert_pages_parallel(
     if effective_threads <= 1 || pages.len() <= 2 {
         let mut batches = Vec::with_capacity(pages.len());
         for page in pages {
-            batches.push(page.to_record_batch(schema, projection)?);
+            batches.push(page.to_record_batch(schema, projection, None)?);
         }
         return Ok(batches);
     }
@@ -457,7 +466,7 @@ fn convert_pages_parallel(
             let handle = s.spawn(move || {
                 let mut batches = Vec::with_capacity(chunk.len());
                 for page in chunk {
-                    batches.push(page.to_record_batch(schema, projection)?);
+                    batches.push(page.to_record_batch(schema, projection, None)?);
                 }
                 Ok(batches)
             });
@@ -636,6 +645,13 @@ impl AsyncBatchStream {
         if let Some(inner) = self.inner.as_mut() {
             inner.next_page_index = start;
             inner.max_page_index = Some(end);
+        }
+        self
+    }
+
+    pub fn with_snapshot(mut self, snapshot: PgSnapshot) -> Self {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.snapshot = Some(snapshot);
         }
         self
     }
