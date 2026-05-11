@@ -1,7 +1,6 @@
 use crate::{
-    codec::{PgDatum, decode_datum, skip_datum},
     file::error::{self, PgError, Result},
-    types::PgSchema,
+    types::{PgAlign, PgDatum, PgSchema, decode_datum, skip_datum},
 };
 use derive_where::derive_where;
 use log::error;
@@ -496,15 +495,6 @@ pub const HEAP_HOT_UPDATED: u16 = 0x4000;
 /// This tuple is a heap-only tuple (HOT chain member, no index entry).
 pub const HEAP_ONLY_TUPLE: u16 = 0x8000;
 
-/// Alignment categories for PostgreSQL types (from pg_attribute.attalign).
-#[derive(Debug, Clone, Copy)]
-pub enum PgAlign {
-    Char = 1,   // 'c'
-    Short = 2,  // 's'
-    Int = 4,    // 'i'
-    Double = 8, // 'd'
-}
-
 /// Minimal column schema info, mirrors relevant fields from pg_attribute.
 #[derive(Debug, Clone)]
 pub struct PgAttInfo {
@@ -518,7 +508,7 @@ pub fn align_to(offset: usize, align: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::codec::PgDatum;
+    use crate::types::PgDatum;
     use crate::table::PgTableReader;
     use crate::util::pg_harness;
 

@@ -1,11 +1,19 @@
-use crate::heap::tuple::PgAlign;
-use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit};
 use std::ffi::CStr;
 use std::sync::Arc;
 
-/// Helper: wrap a DataType in `List(Arc<Field>)` with a nullable "item" field.
-fn list_of(dt: DataType) -> DataType {
-    DataType::List(Arc::new(Field::new("item", dt, true)))
+use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit};
+
+// ────────────────────────────────────────────────────────────────────────────
+// Alignment categories for PostgreSQL types (from pg_attribute.attalign)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Alignment categories for PostgreSQL types (from pg_attribute.attalign).
+#[derive(Debug, Clone, Copy)]
+pub enum PgAlign {
+    Char = 1,   // 'c'
+    Short = 2,  // 's'
+    Int = 4,    // 'i'
+    Double = 8, // 'd'
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -322,82 +330,6 @@ impl PgTypeId {
             | Self::NumericArray
             | Self::UuidArray
             | Self::JsonbArray => 4,
-        }
-    }
-
-    /// Maps this PostgreSQL type to its Arrow `DataType` representation.
-    pub fn arrow_type(self) -> DataType {
-        match self {
-            Self::Bool => DataType::Boolean,
-            Self::Int2 => DataType::Int16,
-            Self::Int4 => DataType::Int32,
-            Self::Int8 => DataType::Int64,
-            Self::Float4 => DataType::Float32,
-            Self::Float8 => DataType::Float64,
-            Self::Oid => DataType::UInt32,
-            Self::Xid => DataType::UInt32,
-            Self::Cid => DataType::UInt32,
-            Self::Xid8 => DataType::UInt64,
-            Self::Date => DataType::Date32,
-            Self::Time => DataType::Time64(TimeUnit::Microsecond),
-            Self::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
-            Self::Timestamptz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            Self::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
-            Self::Timetz => DataType::Time64(TimeUnit::Microsecond),
-            Self::Money => DataType::Int64,
-            Self::Char => DataType::UInt8,
-            Self::Name => DataType::Utf8,
-            Self::Text => DataType::Utf8,
-            Self::Varchar => DataType::Utf8,
-            Self::Bpchar => DataType::Utf8,
-            Self::Json => DataType::Utf8,
-            Self::Xml => DataType::Utf8,
-            Self::Numeric => DataType::Decimal256(38, 0),
-            Self::Bytea => DataType::Binary,
-            Self::Jsonb => DataType::Binary,
-            Self::Jsonpath => DataType::Binary,
-            Self::Uuid => DataType::FixedSizeBinary(16),
-            Self::Macaddr => DataType::FixedSizeBinary(6),
-            Self::Macaddr8 => DataType::FixedSizeBinary(8),
-            Self::Inet => DataType::Binary,
-            Self::Cidr => DataType::Binary,
-            Self::Tid => DataType::Binary,
-            Self::Aclitem => DataType::Binary,
-            Self::Point => DataType::FixedSizeBinary(16),
-            Self::Line => DataType::FixedSizeBinary(24),
-            Self::Lseg => DataType::FixedSizeBinary(32),
-            Self::Box => DataType::FixedSizeBinary(32),
-            Self::Circle => DataType::FixedSizeBinary(24),
-            Self::Path => DataType::Binary,
-            Self::Polygon => DataType::Binary,
-            Self::Bit => DataType::Binary,
-            Self::Varbit => DataType::Binary,
-            // Array types → Arrow List of element type
-            Self::BoolArray => list_of(DataType::Boolean),
-            Self::ByteaArray => list_of(DataType::Binary),
-            Self::CharArray => list_of(DataType::UInt8),
-            Self::NameArray => list_of(DataType::Utf8),
-            Self::Int2Array => list_of(DataType::Int16),
-            Self::Int4Array => list_of(DataType::Int32),
-            Self::Int8Array => list_of(DataType::Int64),
-            Self::Float4Array => list_of(DataType::Float32),
-            Self::Float8Array => list_of(DataType::Float64),
-            Self::TextArray => list_of(DataType::Utf8),
-            Self::VarcharArray => list_of(DataType::Utf8),
-            Self::OidArray => list_of(DataType::UInt32),
-            Self::TidArray => list_of(DataType::Binary),
-            Self::XidArray => list_of(DataType::UInt32),
-            Self::CidArray => list_of(DataType::UInt32),
-            Self::TimestampArray => list_of(DataType::Timestamp(TimeUnit::Microsecond, None)),
-            Self::TimestamptzArray => list_of(DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into()),
-            )),
-            Self::DateArray => list_of(DataType::Date32),
-            Self::TimeArray => list_of(DataType::Time64(TimeUnit::Microsecond)),
-            Self::NumericArray => list_of(DataType::Decimal256(38, 0)),
-            Self::UuidArray => list_of(DataType::FixedSizeBinary(16)),
-            Self::JsonbArray => list_of(DataType::Binary),
         }
     }
 
@@ -816,6 +748,87 @@ impl PgTypeId {
     }
 }
 
+fn list_of(dt: DataType) -> DataType {
+    DataType::List(Arc::new(Field::new("item", dt, true)))
+}
+
+impl PgTypeId {
+    /// Maps this PostgreSQL type to its Arrow `DataType` representation.
+    pub fn arrow_type(self) -> DataType {
+        match self {
+            Self::Bool => DataType::Boolean,
+            Self::Int2 => DataType::Int16,
+            Self::Int4 => DataType::Int32,
+            Self::Int8 => DataType::Int64,
+            Self::Float4 => DataType::Float32,
+            Self::Float8 => DataType::Float64,
+            Self::Oid => DataType::UInt32,
+            Self::Xid => DataType::UInt32,
+            Self::Cid => DataType::UInt32,
+            Self::Xid8 => DataType::UInt64,
+            Self::Date => DataType::Date32,
+            Self::Time => DataType::Time64(TimeUnit::Microsecond),
+            Self::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+            Self::Timestamptz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            Self::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
+            Self::Timetz => DataType::Time64(TimeUnit::Microsecond),
+            Self::Money => DataType::Int64,
+            Self::Char => DataType::UInt8,
+            Self::Name => DataType::Utf8,
+            Self::Text => DataType::Utf8,
+            Self::Varchar => DataType::Utf8,
+            Self::Bpchar => DataType::Utf8,
+            Self::Json => DataType::Utf8,
+            Self::Xml => DataType::Utf8,
+            Self::Numeric => DataType::Decimal256(38, 0),
+            Self::Bytea => DataType::Binary,
+            Self::Jsonb => DataType::Binary,
+            Self::Jsonpath => DataType::Binary,
+            Self::Uuid => DataType::FixedSizeBinary(16),
+            Self::Macaddr => DataType::FixedSizeBinary(6),
+            Self::Macaddr8 => DataType::FixedSizeBinary(8),
+            Self::Inet => DataType::Binary,
+            Self::Cidr => DataType::Binary,
+            Self::Tid => DataType::Binary,
+            Self::Aclitem => DataType::Binary,
+            Self::Point => DataType::FixedSizeBinary(16),
+            Self::Line => DataType::FixedSizeBinary(24),
+            Self::Lseg => DataType::FixedSizeBinary(32),
+            Self::Box => DataType::FixedSizeBinary(32),
+            Self::Circle => DataType::FixedSizeBinary(24),
+            Self::Path => DataType::Binary,
+            Self::Polygon => DataType::Binary,
+            Self::Bit => DataType::Binary,
+            Self::Varbit => DataType::Binary,
+            Self::BoolArray => list_of(DataType::Boolean),
+            Self::ByteaArray => list_of(DataType::Binary),
+            Self::CharArray => list_of(DataType::UInt8),
+            Self::NameArray => list_of(DataType::Utf8),
+            Self::Int2Array => list_of(DataType::Int16),
+            Self::Int4Array => list_of(DataType::Int32),
+            Self::Int8Array => list_of(DataType::Int64),
+            Self::Float4Array => list_of(DataType::Float32),
+            Self::Float8Array => list_of(DataType::Float64),
+            Self::TextArray => list_of(DataType::Utf8),
+            Self::VarcharArray => list_of(DataType::Utf8),
+            Self::OidArray => list_of(DataType::UInt32),
+            Self::TidArray => list_of(DataType::Binary),
+            Self::XidArray => list_of(DataType::UInt32),
+            Self::CidArray => list_of(DataType::UInt32),
+            Self::TimestampArray => list_of(DataType::Timestamp(TimeUnit::Microsecond, None)),
+            Self::TimestamptzArray => list_of(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
+            Self::DateArray => list_of(DataType::Date32),
+            Self::TimeArray => list_of(DataType::Time64(TimeUnit::Microsecond)),
+            Self::NumericArray => list_of(DataType::Decimal256(38, 0)),
+            Self::UuidArray => list_of(DataType::FixedSizeBinary(16)),
+            Self::JsonbArray => list_of(DataType::Binary),
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Type category (from pg_type.typcategory)
 // ────────────────────────────────────────────────────────────────────────────
@@ -1024,7 +1037,6 @@ impl std::fmt::Display for PgDatum {
             // Char / Name
             PgDatum::Char(v) => write!(f, "{}", *v as char),
             PgDatum::Name(bytes) => {
-                use std::ffi::CStr;
                 let column = CStr::from_bytes_until_nul(bytes).unwrap().to_str();
                 write!(f, "{}", String::from(column.unwrap()))
             }
@@ -1103,10 +1115,6 @@ impl std::fmt::Display for PgDatum {
         }
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// PgDatum → Arrow DataType
-// ────────────────────────────────────────────────────────────────────────────
 
 impl PgDatum {
     /// Returns the Arrow `DataType` that this datum maps to.
@@ -1386,9 +1394,7 @@ pub fn decode_fixed(type_id: PgTypeId, bytes: &[u8]) -> Result<PgDatum, DecodeEr
         PgTypeId::Name => {
             // Fixed 64-byte null-padded C string
             check_len("name", 64, len)?;
-            use std::ffi::CStr;
             let column = CStr::from_bytes_until_nul(&bytes[..64]).unwrap().to_str();
-
             Ok(PgDatum::Text(String::from(column.unwrap())))
         }
         // Varlena types should not reach here — caller must use decode_varlena

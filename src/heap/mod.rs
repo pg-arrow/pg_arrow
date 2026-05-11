@@ -7,6 +7,6 @@ pub use page::{
 };
 pub use tuple::{
     BlockIdData, ColumnSearchArg, HEAP_KEYS_UPDATED, HEAP_HOT_UPDATED, HEAP_NATTS_MASK,
-    HEAP_ONLY_TUPLE, HeapTupleData, HeapTupleHeaderData, InfoMask, ItemPointerData, PgAlign,
+    HEAP_ONLY_TUPLE, HeapTupleData, HeapTupleHeaderData, InfoMask, ItemPointerData,
     PgAttInfo, SIZEOF_HEAP_TUPLE_HEADER, align_to,
 };

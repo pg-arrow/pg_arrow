@@ -9,9 +9,10 @@ pub use crate::heap::tuple;
 pub use crate::heap::{
     BlockIdData, ColumnSearchArg, HEAP_NATTS_MASK, HeapPageData, HeapTupleData,
     HeapTupleHeaderData, InfoMask, ItemIdData, ItemPointerData, LP_DEAD, LP_NORMAL, LP_REDIRECT,
-    LP_UNUSED, PAGE_BUFFER_SIZE, PageHeaderData, PageXLogRecPtr, PgAlign, PgAttInfo,
+    LP_UNUSED, PAGE_BUFFER_SIZE, PageHeaderData, PageXLogRecPtr, PgAttInfo,
     SIZEOF_HEAP_TUPLE_HEADER, align_to, read_line_pointer,
 };
+pub use crate::types::PgAlign;
 
 use std::fs;
 use std::path::PathBuf;

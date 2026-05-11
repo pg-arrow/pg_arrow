@@ -4,10 +4,9 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use derive_where::derive_where;
 
-use crate::codec::{PgTypeId, PgTypeLen, skip_datum};
 use crate::file::error;
 use crate::heap::tuple::{HEAP_NATTS_MASK, HeapTupleData, InfoMask, SIZEOF_HEAP_TUPLE_HEADER};
-use crate::table::{ColumnBuilder, extract_column_bytes, extract_fixed_bytes};
+use crate::types::{ColumnBuilder, PgTypeId, PgTypeLen, extract_column_bytes, extract_fixed_bytes, skip_datum};
 use crate::types::PgSchema;
 
 pub const PAGE_BUFFER_SIZE: usize = 8 * 1024;

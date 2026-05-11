@@ -78,7 +78,7 @@ pub struct PgClass {
 
 use super::PgCatalogRelation;
 
-use crate::codec::PgDatum;
+use super::codec::PgDatum;
 use crate::file::error::{PgError, Result};
 use crate::heap::tuple::{ColumnSearchArg, HeapTupleData};
 use crate::types::PgSchema;
@@ -109,7 +109,7 @@ fn next_datum(
     let col = schema.column(col_index).unwrap();
     let align = col.type_id.align();
     if align > 1 {
-        let is_varlena = matches!(col.type_id.type_len(), crate::codec::PgTypeLen::Varlena);
+        let is_varlena = matches!(col.type_id.type_len(), super::codec::PgTypeLen::Varlena);
         if is_varlena {
             // att_align_pointer: only align if the byte at offset is a pad byte (0x00).
             if tuple.data.get(*offset).is_none_or(|&b| b == 0) {
@@ -370,8 +370,8 @@ impl PgClass {
     ///
     /// This allows generic tuple-walking code to decode pg_class rows
     /// without hardcoding types at every call site.
-    pub const ATTR_TYPES: [crate::codec::PgTypeId; Self::NUM_FIXED_ATTRS] = {
-        use crate::codec::PgTypeId as T;
+    pub const ATTR_TYPES: [super::codec::PgTypeId; Self::NUM_FIXED_ATTRS] = {
+        use super::codec::PgTypeId as T;
         [
             T::Oid,    // oid
             T::Name,   // relname
@@ -446,7 +446,7 @@ impl PgCatalogRelation for PgClass {
     const RELATION_OID: u32 = PgClass::RELATION_OID;
     const NUM_FIXED_ATTRS: usize = PgClass::NUM_FIXED_ATTRS;
 
-    fn attr_types() -> &'static [crate::codec::PgTypeId] {
+    fn attr_types() -> &'static [super::codec::PgTypeId] {
         &PgClass::ATTR_TYPES
     }
     fn attr_names() -> &'static [&'static str] {
@@ -532,8 +532,8 @@ impl PgType {
     pub const RELATION_OID: u32 = 1247;
     pub const NUM_FIXED_ATTRS: usize = 29;
 
-    pub const ATTR_TYPES: [crate::codec::PgTypeId; Self::NUM_FIXED_ATTRS] = {
-        use crate::codec::PgTypeId as T;
+    pub const ATTR_TYPES: [super::codec::PgTypeId; Self::NUM_FIXED_ATTRS] = {
+        use super::codec::PgTypeId as T;
         [
             T::Oid,  // oid
             T::Name, // typname
@@ -604,7 +604,7 @@ impl PgCatalogRelation for PgType {
     const RELATION_OID: u32 = PgType::RELATION_OID;
     const NUM_FIXED_ATTRS: usize = PgType::NUM_FIXED_ATTRS;
 
-    fn attr_types() -> &'static [crate::codec::PgTypeId] {
+    fn attr_types() -> &'static [super::codec::PgTypeId] {
         &PgType::ATTR_TYPES
     }
     fn attr_names() -> &'static [&'static str] {
@@ -677,8 +677,8 @@ impl PgAttribute {
     pub const RELATION_OID: u32 = 1249;
     pub const NUM_FIXED_ATTRS: usize = 20;
 
-    pub const ATTR_TYPES: [crate::codec::PgTypeId; Self::NUM_FIXED_ATTRS] = {
-        use crate::codec::PgTypeId as T;
+    pub const ATTR_TYPES: [super::codec::PgTypeId; Self::NUM_FIXED_ATTRS] = {
+        use super::codec::PgTypeId as T;
         [
             T::Oid,  // attrelid
             T::Name, // attname
@@ -731,7 +731,7 @@ impl PgCatalogRelation for PgAttribute {
     const RELATION_OID: u32 = PgAttribute::RELATION_OID;
     const NUM_FIXED_ATTRS: usize = PgAttribute::NUM_FIXED_ATTRS;
 
-    fn attr_types() -> &'static [crate::codec::PgTypeId] {
+    fn attr_types() -> &'static [super::codec::PgTypeId] {
         &PgAttribute::ATTR_TYPES
     }
     fn attr_names() -> &'static [&'static str] {
@@ -802,8 +802,8 @@ impl PgProc {
     pub const RELATION_OID: u32 = 1255;
     pub const NUM_FIXED_ATTRS: usize = 20;
 
-    pub const ATTR_TYPES: [crate::codec::PgTypeId; Self::NUM_FIXED_ATTRS] = {
-        use crate::codec::PgTypeId as T;
+    pub const ATTR_TYPES: [super::codec::PgTypeId; Self::NUM_FIXED_ATTRS] = {
+        use super::codec::PgTypeId as T;
         [
             T::Oid,    // oid
             T::Name,   // proname
@@ -856,7 +856,7 @@ impl PgCatalogRelation for PgProc {
     const RELATION_OID: u32 = PgProc::RELATION_OID;
     const NUM_FIXED_ATTRS: usize = PgProc::NUM_FIXED_ATTRS;
 
-    fn attr_types() -> &'static [crate::codec::PgTypeId] {
+    fn attr_types() -> &'static [super::codec::PgTypeId] {
         &PgProc::ATTR_TYPES
     }
     fn attr_names() -> &'static [&'static str] {

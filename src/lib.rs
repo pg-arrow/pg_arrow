@@ -1,4 +1,3 @@
-pub mod codec;
 pub mod file;
 pub mod heap;
 pub mod table;
