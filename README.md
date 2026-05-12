@@ -55,9 +55,20 @@ just --list                   # Show all available recipes
 
 ## PostgreSQL Setup for Testing
 
-### Quick Setup Script
+### Prerequisites
 
-Use `scripts/setup-postgres.sh` to automate PostgreSQL setup for testing:
+PostgreSQL setup uses the [`pg-test-harness`](https://github.com/nmbr7/pg-test-harness) script collection. Clone it and set `PG_HARNESS_DIR`:
+
+```bash
+git clone https://github.com/nmbr7/pg-test-harness /path/to/pg-test-harness
+export PG_HARNESS_DIR=/path/to/pg-test-harness
+```
+
+Add the export to your shell profile (`~/.zshrc`, `~/.bashrc`) to persist it.
+
+### Quick Setup
+
+Use `just` recipes (which set `TARGET_DIR`/`TESTDATA_DIR` automatically):
 
 ```bash
 # Full setup: build from source, init cluster, load test data
@@ -72,11 +83,11 @@ just pg-init pg18             # Init cluster (source must be built)
 just pg-testdata pg18         # Load test data into initialised cluster
 ```
 
-Or invoke the script directly:
+Or invoke the harness script directly:
 
 ```bash
-./scripts/setup-postgres.sh -b pg18 -B -i -t      # pg18, full setup
-./scripts/setup-postgres.sh -b latest -B -i -t -s  # latest, simple schema
+TARGET_DIR="$(pwd)" TESTDATA_DIR="$(pwd)/testdata" \
+    bash "$PG_HARNESS_DIR/scripts/setup-postgres.sh" -b pg18 -B -i -t
 ```
 
 #### Script options
@@ -112,9 +123,12 @@ pg_arrow/
 │       ├── data/
 │       ├── build/
 │       └── install/bin/
-├── pg-test-config.toml
+└── pg-test-config.toml
+
+$PG_HARNESS_DIR/
 └── scripts/
-    └── setup-postgres.sh
+    ├── setup-postgres.sh      # PostgreSQL build/init/test-data setup
+    └── pgbackrest-backup.sh   # WAL archiving and backup management
 ```
 
 #### `pg-test-config.toml` format
