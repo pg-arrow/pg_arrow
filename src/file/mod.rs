@@ -34,12 +34,12 @@ pub fn get_data_dir() -> Result<String, Box<dyn std::error::Error>> {
     }
 
     // Fall back to the TOML config (for tests)
-    let project_root_dir = env!("CARGO_MANIFEST_DIR");
-
-    let mut test_config_file = PathBuf::new();
-    test_config_file.push(project_root_dir);
-    test_config_file.push("pg-test-config.toml");
-    let config_str = fs::read_to_string(test_config_file)?;
+    let config_path = if let Ok(p) = std::env::var("PG_ARROW_TEST_CONFIG") {
+        PathBuf::from(p)
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pg-test-config.toml")
+    };
+    let config_str = fs::read_to_string(config_path)?;
 
     let value = config_str.parse::<Table>()?;
 

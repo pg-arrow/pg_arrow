@@ -19,8 +19,8 @@ const PAGE_SIZE: usize = 8192;
 /// Resolve the heap file path for the test database's pgbench_accounts table.
 /// Falls back to pg-test-config.toml like the rest of the test suite.
 fn get_heap_file_path() -> String {
-    let project_root = env!("CARGO_MANIFEST_DIR");
-    let config_path = format!("{}/pg-test-config.toml", project_root);
+    let config_path = std::env::var("PG_ARROW_TEST_CONFIG")
+        .unwrap_or_else(|_| format!("{}/pg-test-config.toml", env!("CARGO_MANIFEST_DIR")));
     let config_str = std::fs::read_to_string(&config_path)
         .unwrap_or_else(|e| panic!("Cannot read {config_path}: {e}"));
     let table: toml::Table = config_str.parse().unwrap();
