@@ -27,7 +27,7 @@ bytes = "1"
 [dev-dependencies]
 criterion = "0.8"
 iai = "0.1"
-pg-test-harness = { path = "../utilities/pg-test-harness" }
+pg-test-harness = { git = "https://github.com/pg-arrow/utils.git", rev = "17e2ed8bb7694b0491358b8534a2fd61cd2df062" }
 
 [[bench]]
 name = "criterion_bench"
