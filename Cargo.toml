@@ -2,7 +2,14 @@
 name = "pg_arrow"
 version = "0.1.0"
 edition = "2024"
-
+description = "Low-level library that reads PostgreSQL data files directly and converts them to Apache Arrow format. Parses heap files and the system catalog without a running PostgreSQL server."
+license = "Apache-2.0"
+repository = "https://github.com/pg-arrow/pg_arrow"
+homepage = "https://github.com/pg-arrow/pg_arrow"
+documentation = "https://docs.rs/pg_arrow"
+readme = "README.md"
+keywords = ["postgres", "postgresql", "arrow", "heap", "parser"]
+categories = ["database", "parser-implementations", "encoding"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

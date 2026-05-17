@@ -1,6 +1,10 @@
 # pg_arrow
 
-Low-level library for reading PostgreSQL data files directly and converting them to [Apache Arrow](https://arrow.apache.org/) format. Used by [pgfusion](../pgfusion/) as the page-parsing and Arrow conversion layer.
+> **Status:** Work in progress. Public API, error types, and on-disk format coverage may change. Not yet production-ready.
+>
+> **Current implementation:** reads PostgreSQL heap files **directly from disk** (no shared buffer pool yet). A buffer-pool / page-cache layer is on the roadmap.
+
+Low-level library for reading PostgreSQL data files directly and converting them to [Apache Arrow](https://arrow.apache.org/) format. Used by [pgfusion](https://github.com/pg-arrow/pgfusion) as the page-parsing and Arrow conversion layer.
 
 ## Prerequisites
 
