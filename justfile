@@ -94,10 +94,11 @@ bench-all: bench bench-iai bench-io
 
 # ── Examples ──────────────────────────────────────────────────────────────────
 
-# Usage: just example-table-reader /path/to/pgdata 16384
+# Usage: just example-table-reader /path/to/pgdata
+#        just example-table-reader /path/to/pgdata pgbench_test
 [group('examples')]
-example-table-reader data_dir db_id="16384":
-    cargo run --example table_reader -- {{data_dir}} {{db_id}}
+example-table-reader data_dir db="postgres":
+    cargo run --example table_reader -- {{data_dir}} {{db}}
 
 # ── PostgreSQL CLI ────────────────────────────────────────────────────────────
 
@@ -198,10 +199,11 @@ flamegraph-test test_name:
     open flamegraph.svg
 
 # Flamegraph for the table_reader example
-# Usage: just flamegraph-example /path/to/pgdata 16384
+# Usage: just flamegraph-example /path/to/pgdata
+#        just flamegraph-example /path/to/pgdata pgbench_test
 [group('profiling')]
-flamegraph-example data_dir db_id="16384":
-    cargo flamegraph --example table_reader -o flamegraph.svg -- {{data_dir}} {{db_id}}
+flamegraph-example data_dir db="postgres":
+    cargo flamegraph --example table_reader -o flamegraph.svg -- {{data_dir}} {{db}}
     open flamegraph.svg
 
 # Samply CPU profile for a bench (macOS/Linux — opens in browser)

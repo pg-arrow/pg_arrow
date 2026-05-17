@@ -1,11 +1,16 @@
-use pg_arrow::table::PgTableReader;
-use pg_test_harness::db_oid_blocking;
+use pg_arrow::table::{PgTableReader, get_database_oid};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let db_id = db_oid_blocking("postgres");
+    let mut args = std::env::args().skip(1);
+    let data_dir = args.next().expect("usage: table_reader <pgdata> [db_name]");
+    pg_arrow::file::set_data_dir(data_dir);
+    let db_name = args.next().unwrap_or_else(|| "postgres".to_string());
+
+    let db_id = get_database_oid(&db_name)?
+        .ok_or_else(|| format!("database not found: {db_name}"))? as usize;
 
     // Bootstrap: reads pg_class + pg_attribute catalogs
     println!("Bootstrapping catalogs for db_id={db_id}...");
@@ -18,21 +23,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Fetch all rows
     let start = Instant::now();
-    let rows = reader.fetch_by_limit(10_000_000)?;
+    let rows = reader.fetch_all()?;
     let duration = start.elapsed();
     println!("Elapsed: {:.3} ms", duration.as_secs_f64() * 1000.0);
     println!("Total rows: {}", rows.len());
 
-    // Fetch all rows
-    let start = Instant::now();
-    let rows = reader.fetch_by_limit(10_000_000)?;
-    let duration = start.elapsed();
-    println!("Elapsed: {:.3} ms", duration.as_secs_f64() * 1000.0);
-    println!("Total rows: {}", rows.len());
-
-    // Fetch with limit
-    let rows = reader.fetch_by_limit(5)?;
-    for (_i, row) in rows.iter().enumerate() {
+    // Print first 5
+    for row in rows.iter().take(5) {
         println!("{}", row);
     }
 

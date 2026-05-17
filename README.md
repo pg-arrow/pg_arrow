@@ -36,7 +36,8 @@ cargo install samply            # samply-* recipes
 cargo build
 
 # Run the table_reader example
-just example-table-reader /path/to/pgdata 16384
+just example-table-reader /path/to/pgdata           # defaults to db "postgres"
+just example-table-reader /path/to/pgdata pgbench_test
 
 # Run tests
 just test
@@ -61,11 +62,11 @@ just --list                   # Show all available recipes
 
 ### Prerequisites
 
-PostgreSQL setup uses the [`pg-test-harness`](https://github.com/nmbr7/pg-test-harness) script collection. Clone it and set `PG_HARNESS_DIR`:
+PostgreSQL setup uses the [`pg-test-harness`](https://github.com/pg-arrow/utils/tree/main/pg-test-harness) scripts. Clone the [pg-arrow/utils](https://github.com/pg-arrow/utils) repo and point `PG_HARNESS_DIR` at the harness subdirectory:
 
 ```bash
-git clone https://github.com/nmbr7/pg-test-harness /path/to/pg-test-harness
-export PG_HARNESS_DIR=/path/to/pg-test-harness
+git clone https://github.com/pg-arrow/utils /path/to/utils
+export PG_HARNESS_DIR=/path/to/utils/pg-test-harness
 ```
 
 Add the export to your shell profile (`~/.zshrc`, `~/.bashrc`) to persist it.
