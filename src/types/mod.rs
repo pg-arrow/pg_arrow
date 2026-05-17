@@ -8,7 +8,7 @@ pub mod schema;
 pub use catalog::PgCatalogRelation;
 pub use column::PgColumn;
 pub use schema::PgSchema;
-pub use pg_type::{PgAttribute, PgClass, PgProc, PgType};
+pub use pg_type::{PgAttribute, PgClass, PgDatabase, PgProc, PgType};
 pub use codec::{
     DecodeError, PgAlign, PgDatum, PgTypeCategory, PgTypeId, PgTypeInfo, PgTypeLen, PgTypeStorage,
     decode_datum, decode_fixed, decode_varlena, read_varlena_header, skip_datum,

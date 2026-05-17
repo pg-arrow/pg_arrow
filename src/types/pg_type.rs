@@ -866,3 +866,62 @@ impl PgCatalogRelation for PgProc {
         "pg_proc"
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// PgDatabase
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Minimal view of a `pg_database` row.
+///
+/// `pg_database` is a shared catalog at the fixed OID 1262 and is relmapped,
+/// so its filenode is also 1262 on every cluster. The heap file lives at
+/// `$PGDATA/global/1262`.
+///
+/// Only the fixed-width prefix needed for name → OID lookup is decoded
+/// (`oid`, `datname`). The trailing varlena columns are not parsed.
+#[derive(Debug, Clone)]
+pub struct PgDatabase {
+    pub oid: u32,
+    pub datname: String,
+}
+
+impl PgDatabase {
+    pub const RELATION_OID: u32 = 1262;
+    /// Number of fixed-prefix columns walked by [`from_row`]. Stops after `datname`.
+    pub const NUM_FIXED_ATTRS: usize = 2;
+
+    pub const ATTR_TYPES: [super::codec::PgTypeId; Self::NUM_FIXED_ATTRS] = {
+        use super::codec::PgTypeId as T;
+        [
+            T::Oid,  // oid
+            T::Name, // datname
+        ]
+    };
+
+    pub const ATTR_NAMES: [&'static str; Self::NUM_FIXED_ATTRS] = ["oid", "datname"];
+
+    /// Build a `PgDatabase` from a decoded heap tuple row.
+    pub fn from_row(tuple: &HeapTupleData, schema: &PgSchema) -> Result<Self> {
+        let mut offset = 0usize;
+        let mut col = |i| next_datum(tuple, schema, &mut offset, i);
+        Ok(PgDatabase {
+            oid: as_u32(col(0)?),
+            datname: as_name_str(col(1)?),
+        })
+    }
+}
+
+impl PgCatalogRelation for PgDatabase {
+    const RELATION_OID: u32 = PgDatabase::RELATION_OID;
+    const NUM_FIXED_ATTRS: usize = PgDatabase::NUM_FIXED_ATTRS;
+
+    fn attr_types() -> &'static [super::codec::PgTypeId] {
+        &PgDatabase::ATTR_TYPES
+    }
+    fn attr_names() -> &'static [&'static str] {
+        &PgDatabase::ATTR_NAMES
+    }
+    fn catalog_name() -> &'static str {
+        "pg_database"
+    }
+}

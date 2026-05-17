@@ -70,11 +70,19 @@ mod tests {
     fn test_parse_filenode_map() {
         let data_dir = get_data_dir().unwrap();
 
-        let buf = fs::read(format!("{}/base/16384/pg_filenode.map", data_dir)).unwrap();
+        // Use global/pg_filenode.map: shared catalogs are always present.
+        let buf = fs::read(format!("{}/global/pg_filenode.map", data_dir)).unwrap();
         let relmap = relation::parse_relmap(&buf).unwrap();
 
         assert!(relmap.num_mappings > 0);
         assert_eq!(relmap.mappings.len(), relmap.num_mappings as usize);
+
+        // pg_database has stable catalog OID 1262 and is nailed-down (relmapped).
+        println!("num_mappings = {}", relmap.num_mappings);
+        println!("{:>6}  {:>10}", "oid", "filenode");
+        for m in &relmap.mappings {
+            println!("{:>6}  {:>10}", m.mapoid, m.mapfilenode);
+        }
     }
 
     #[test]

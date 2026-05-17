@@ -1054,6 +1054,84 @@ pub fn decode_row_projected(
     Ok(PgRow { columns })
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// pg_database lookup
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Iterate every live row in the shared `pg_database` catalog.
+///
+/// Reads `$PGDATA/global/1262` directly (the file location is fixed: OID and
+/// filenode are both 1262, no filenode-map lookup needed), walks each heap
+/// page, decodes the `oid` and `datname` columns of every normal tuple, and
+/// returns them as a `Vec<PgDatabase>`.
+///
+/// Dead-or-redirect line pointers are skipped; only `LP_NORMAL` tuples are
+/// returned. The function does not honour MVCC visibility — every undeleted
+/// tuple on disk is returned, which is sufficient for finding a database by
+/// name on a quiescent cluster.
+pub fn list_databases() -> Result<Vec<crate::types::PgDatabase>> {
+    use crate::file::reader::TableFileReader;
+    use crate::file::{LP_NORMAL};
+    use crate::types::{PgCatalogRelation, PgDatabase};
+
+    let schema = PgDatabase::catalog_schema();
+    // db_id == 0 routes the reader to $PGDATA/global/<relfilenode>.
+    let reader = TableFileReader::new(0, PgDatabase::RELATION_OID as usize);
+    let mut page_reader = reader.get_page_reader()?;
+
+    let mut out = Vec::new();
+    let mut page_index = 0usize;
+    loop {
+        let page = match page_reader.get_page_by_index(page_index) {
+            Ok(p) => p,
+            Err(_) => break, // EOF: no more pages
+        };
+
+        for posid in 0..page.lp_num {
+            let lp = page.lp_items[posid];
+            if lp.lp_flags() != LP_NORMAL {
+                continue;
+            }
+            let tuple = match page.get_row_data(posid as u16) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            // Skip deleted/updated tuples — any non-zero xmax means a
+            // transaction has marked this row for removal. Without proper
+            // MVCC visibility we can't tell aborts apart from commits, so
+            // we conservatively drop anything that isn't pristine-live.
+            if tuple.header.t_xmax != 0 {
+                continue;
+            }
+            if let Ok(row) = PgDatabase::from_row(&tuple, &schema) {
+                if !row.datname.is_empty() {
+                    out.push(row);
+                }
+            }
+        }
+
+        page_index += 1;
+    }
+
+    Ok(out)
+}
+
+/// Look up a database OID by name.
+///
+/// Returns `Ok(Some(oid))` if a database with the given `datname` exists in
+/// `pg_database`, `Ok(None)` if no match is found, or `Err` if the
+/// `global/1262` heap file cannot be read.
+///
+/// This is the high-level entry point that does **not** require the caller to
+/// know the database OID up front — it bypasses both the per-database catalog
+/// and the filenode map.
+pub fn get_database_oid(datname: &str) -> Result<Option<u32>> {
+    Ok(list_databases()?
+        .into_iter()
+        .find(|d| d.datname == datname)
+        .map(|d| d.oid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1251,5 +1329,98 @@ mod tests {
         assert_eq!(reader.db_id(), 16384);
         assert_eq!(reader.table_name(), None);
         assert!(reader.schema().is_none());
+    }
+
+    #[test]
+    fn test_list_databases() {
+        let dbs = super::list_databases().expect("list_databases");
+        assert!(!dbs.is_empty(), "pg_database must have at least one row");
+        // template1 / template0 / postgres always exist after initdb.
+        let names: Vec<&str> = dbs.iter().map(|d| d.datname.as_str()).collect();
+        assert!(names.contains(&"template1"), "names = {:?}", names);
+        assert!(names.contains(&"postgres"), "names = {:?}", names);
+        for d in &dbs {
+            println!("{:>6}  {}", d.oid, d.datname);
+        }
+    }
+
+    #[test]
+    fn test_get_database_oid() {
+        let oid = super::get_database_oid("postgres")
+            .expect("get_database_oid")
+            .expect("postgres database must exist");
+        assert!(oid > 0);
+
+        assert!(super::get_database_oid("__definitely_not_a_db__").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_table_segment_sizes() {
+        use crate::file::reader::TableFileReader;
+
+        // pg_database lives at global/1262 — guaranteed to exist and fit in one segment.
+        let reader = TableFileReader::new(0, 1262);
+        let segs = reader.segment_sizes().expect("segment_sizes");
+        assert!(!segs.is_empty(), "global/1262 must have at least one segment");
+        assert_eq!(segs.len(), 1, "pg_database always fits in one segment");
+        let seg = &segs[0];
+        assert!(seg.bytes > 0);
+        assert!(seg.pages > 0);
+        assert_eq!(seg.bytes, seg.pages * 8192);
+        println!("pg_database: {} bytes, {} pages, path={}",
+                 seg.bytes, seg.pages, seg.path.display());
+
+        let n = reader.num_pages().expect("num_pages");
+        assert_eq!(n, seg.pages);
+    }
+
+    #[test]
+    fn test_table_segment_sizes_multi_segment() {
+        use crate::file::reader::TableFileReader;
+        use crate::file::page::PAGES_PER_SEGMENT;
+
+        // Skip if tpch DB / lineitem don't exist (e.g. clean dev box).
+        let tpch_oid = match super::get_database_oid("tpch").unwrap_or(None) {
+            Some(o) => o as usize,
+            None => {
+                eprintln!("[skip] tpch database not present");
+                return;
+            }
+        };
+
+        // Look up lineitem's relfilenode via pg_class instead of hardcoding.
+        let reader = crate::table::PgTableReader::new(tpch_oid).unwrap();
+        let lineitem = match reader
+            .pg_class_cache
+            .iter()
+            .find(|c| c.relname == "lineitem" && c.relkind == b'r')
+        {
+            Some(c) => c.relfilenode as usize,
+            None => {
+                eprintln!("[skip] lineitem table not present in tpch");
+                return;
+            }
+        };
+
+        let r = TableFileReader::new(tpch_oid, lineitem);
+        let segs = r.segment_sizes().expect("segment_sizes");
+        assert!(segs.len() >= 2, "lineitem at SF10 must span multiple segments; got {}", segs.len());
+
+        // Every non-final segment must be exactly PAGES_PER_SEGMENT.
+        for s in &segs[..segs.len() - 1] {
+            assert_eq!(
+                s.pages, PAGES_PER_SEGMENT,
+                "non-final segment {} is short ({} pages); expected {}",
+                s.path.display(), s.pages, PAGES_PER_SEGMENT
+            );
+        }
+        // Final segment is < PAGES_PER_SEGMENT (otherwise the next segment would exist).
+        assert!(segs.last().unwrap().pages < PAGES_PER_SEGMENT);
+
+        let total = r.num_pages().unwrap();
+        let summed: usize = segs.iter().map(|s| s.pages).sum();
+        assert_eq!(total, summed);
+        println!("lineitem: {} segments, {} pages total ({} MB)",
+                 segs.len(), total, total * 8192 / (1024 * 1024));
     }
 }

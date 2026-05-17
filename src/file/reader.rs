@@ -70,6 +70,18 @@ impl Default for TableFileReader {
     }
 }
 
+/// Size of one heap-segment file backing a relation.
+///
+/// Returned by [`TableFileReader::segment_sizes`]. Note that `pages` is the
+/// page count rounded down — a partially-written trailing page is excluded,
+/// matching PostgreSQL's `mdnblocks()` behaviour.
+#[derive(Debug, Clone)]
+pub struct SegmentSize {
+    pub path: PathBuf,
+    pub bytes: usize,
+    pub pages: usize,
+}
+
 impl TableFileReader {
     pub fn get_page_reader(self) -> Result<PageReader<TableFileReader>> {
         Ok(PageReader {
@@ -78,15 +90,74 @@ impl TableFileReader {
         })
     }
 
+    /// Total number of 8 KiB pages backing this relation on disk.
+    ///
+    /// Mirrors PostgreSQL's `mdnblocks()` (src/backend/storage/smgr/md.c):
+    /// walk segments 0, 1, 2, ... in order. A segment that holds fewer than
+    /// `PAGES_PER_SEGMENT` pages — or doesn't exist — terminates the walk;
+    /// the total is `complete_segments * PAGES_PER_SEGMENT + partial_pages`.
+    ///
+    /// This is the authoritative on-disk size and should be preferred over
+    /// `pg_class.relpages`, which is a planner hint maintained only by
+    /// `ANALYZE` / `VACUUM` and goes stale after bulk INSERTs.
+    pub fn num_pages(&self) -> Result<usize> {
+        let segment_sizes = self.segment_sizes()?;
+        Ok(segment_sizes.iter().map(|s| s.pages).sum())
+    }
+
+    /// Per-segment size breakdown for this relation.
+    ///
+    /// Returns `(segment_path, file_bytes, pages)` for each segment present
+    /// on disk, in segment-number order starting at 0. Walks until a segment
+    /// is short (< 1 GiB) or absent. Useful for diagnostics, allocation
+    /// planning, and validating that segment files are well-formed.
+    pub fn segment_sizes(&self) -> Result<Vec<SegmentSize>> {
+        let mut out = Vec::new();
+        let mut segno = 0usize;
+        loop {
+            let first_page_of_segment = segno * PAGES_PER_SEGMENT;
+            let (path, _offset) = self.get_page_file_and_offset(first_page_of_segment)?;
+
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // No more segments — stop. (Matches PG: missing segment
+                    // after a full one means EOF of the relation.)
+                    break;
+                }
+                Err(_) => return Err(PgError::Generic),
+            };
+            let bytes = meta.len() as usize;
+            // Heap files are page-aligned; tolerate a torn trailing write by
+            // truncating to whole pages, matching mdnblocks (`size / BLCKSZ`).
+            let pages = bytes / PAGE_BUFFER_SIZE;
+
+            out.push(SegmentSize { path, bytes, pages });
+
+            if pages < PAGES_PER_SEGMENT {
+                // Partial segment — relation ends here.
+                break;
+            }
+            segno += 1;
+        }
+        Ok(out)
+    }
+
     fn get_page_file_and_offset(&self, page_index: usize) -> Result<(PathBuf, usize)> {
         let segment_num = page_index / PAGES_PER_SEGMENT;
         let page_in_segment = page_index % PAGES_PER_SEGMENT;
 
         let data_dir = crate::file::get_data_dir().unwrap();
-        let table_file = PathBuf::from(format!(
-            "{}/base/{}/{}",
-            data_dir, self.db_id, self.relation_id
-        ));
+        // Convention: db_id == 0 routes to the cluster-wide global/ directory
+        // (used for shared catalogs like pg_database, pg_authid, etc.).
+        let table_file = if self.db_id == 0 {
+            PathBuf::from(format!("{}/global/{}", data_dir, self.relation_id))
+        } else {
+            PathBuf::from(format!(
+                "{}/base/{}/{}",
+                data_dir, self.db_id, self.relation_id
+            ))
+        };
 
         let segment_path = if segment_num == 0 {
             table_file
