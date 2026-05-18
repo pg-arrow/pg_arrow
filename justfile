@@ -105,8 +105,10 @@ example-table-reader data_dir db="postgres":
 # Open a psql session for a given PostgreSQL version
 # Usage: just psql pg18   or   just psql pg18 test
 [group('postgres')]
-psql pg=pg_version db="postgres":
-    @bin=$(awk -v s="postgres.{{pg}}" '$0~"\\["s"\\]"{f=1} f&&$1=="bin_dir"{gsub(/.*= *"|"$/,""); print $0; exit}' pg-test-config.toml); \
+psql pg=pg_version db="postgres": check-harness
+    @cfg="$PG_HARNESS_DIR/pg-test-config.toml"; \
+     bin=$(awk -v s="postgres.{{pg}}" '$0~"\\["s"\\]"{f=1} f&&$1=="bin_dir"{gsub(/.*= *"|"$/,""); print $0; exit}' "$cfg"); \
+     case "$bin" in /*) ;; *) bin="$PG_HARNESS_DIR/$bin" ;; esac; \
      DYLD_LIBRARY_PATH="$bin/../lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" "$bin/psql" {{db}}
 
 # ── PostgreSQL Setup ──────────────────────────────────────────────────────────
@@ -115,38 +117,38 @@ harness_setup := env_var_or_default("PG_HARNESS_DIR", "") + "/scripts/setup-post
 
 [private]
 check-harness:
-    @[ -n "${PG_HARNESS_DIR:-}" ] || { echo "error: PG_HARNESS_DIR is not set\nSet it to your pg-test-harness clone: export PG_HARNESS_DIR=/path/to/pg-test-harness"; exit 1; }
+    @[ -n "${PG_HARNESS_DIR:-}" ] || { echo "error: PG_HARNESS_DIR is not set\nSet it to your pg-test-harness clone: export PG_HARNESS_DIR=/path/to/utils/pg-test-harness"; exit 1; }
 
 # Full setup: build from source, init cluster, load test data
 # Usage: just pg-setup pg18   (or pg17 / latest)
 [group('postgres')]
 pg-setup pg=pg_version: check-harness
-    TARGET_DIR="$(pwd)" TESTDATA_DIR="$(pwd)/testdata" bash {{harness_setup}} -b {{pg}} -B -i -t
+    bash {{harness_setup}} -b {{pg}} -B -i -t
 
 # Full setup with simple schema (no pgbench tables)
 [group('postgres')]
 pg-setup-simple pg=pg_version: check-harness
-    TARGET_DIR="$(pwd)" TESTDATA_DIR="$(pwd)/testdata" bash {{harness_setup}} -b {{pg}} -B -i -t -s
+    bash {{harness_setup}} -b {{pg}} -B -i -t -s
 
 # Build PostgreSQL source only
 [group('postgres')]
 pg-build pg=pg_version: check-harness
-    TARGET_DIR="$(pwd)" TESTDATA_DIR="$(pwd)/testdata" bash {{harness_setup}} -b {{pg}} -B
+    bash {{harness_setup}} -b {{pg}} -B
 
 # Init cluster only (source must already be built)
 [group('postgres')]
 pg-init pg=pg_version: check-harness
-    TARGET_DIR="$(pwd)" TESTDATA_DIR="$(pwd)/testdata" bash {{harness_setup}} -b {{pg}} -i
+    bash {{harness_setup}} -b {{pg}} -i
 
 # Load test data into an already-initialised cluster
 [group('postgres')]
 pg-testdata pg=pg_version: check-harness
-    TARGET_DIR="$(pwd)" TESTDATA_DIR="$(pwd)/testdata" bash {{harness_setup}} -b {{pg}} -t
+    bash {{harness_setup}} -b {{pg}} -t
 
 # Create pgbench_test db with pgbench data (SF=1 by default; override with PGBENCH_SCALE=N or PGBENCH_DBNAME=name)
 [group('postgres')]
 pg-setup-pgbench pg=pg_version: check-harness
-    TARGET_DIR="$(pwd)" TESTDATA_DIR="$(pwd)/testdata" bash {{harness_setup}} -b {{pg}} -p
+    bash {{harness_setup}} -b {{pg}} -p
 
 # ── pgbackrest ────────────────────────────────────────────────────────────────
 
@@ -155,32 +157,32 @@ harness_backup := env_var_or_default("PG_HARNESS_DIR", "") + "/scripts/pgbackres
 # Configure pgbackrest for WAL archiving
 [group('backup')]
 backup-setup pg=pg_version: check-harness
-    TESTDATA_DIR="$(pwd)/testdata" PG_VERSION={{pg}} bash {{harness_backup}} setup
+    PG_VERSION={{pg}} bash {{harness_backup}} setup
 
 # Full backup
 [group('backup')]
 backup-full pg=pg_version: check-harness
-    TESTDATA_DIR="$(pwd)/testdata" PG_VERSION={{pg}} bash {{harness_backup}} full
+    PG_VERSION={{pg}} bash {{harness_backup}} full
 
 # Incremental backup
 [group('backup')]
 backup-incr pg=pg_version: check-harness
-    TESTDATA_DIR="$(pwd)/testdata" PG_VERSION={{pg}} bash {{harness_backup}} incr
+    PG_VERSION={{pg}} bash {{harness_backup}} incr
 
 # Differential backup
 [group('backup')]
 backup-diff pg=pg_version: check-harness
-    TESTDATA_DIR="$(pwd)/testdata" PG_VERSION={{pg}} bash {{harness_backup}} diff
+    PG_VERSION={{pg}} bash {{harness_backup}} diff
 
 # Show backup information
 [group('backup')]
 backup-info pg=pg_version: check-harness
-    TESTDATA_DIR="$(pwd)/testdata" PG_VERSION={{pg}} bash {{harness_backup}} info
+    PG_VERSION={{pg}} bash {{harness_backup}} info
 
 # Usage: just backup-restore /path/to/restore/dir
 [group('backup')]
 backup-restore target_dir pg=pg_version: check-harness
-    TESTDATA_DIR="$(pwd)/testdata" PG_VERSION={{pg}} bash {{harness_backup}} restore -t {{target_dir}}
+    PG_VERSION={{pg}} bash {{harness_backup}} restore -t {{target_dir}}
 
 # ── Flamegraph & Profiling ────────────────────────────────────────────────────
 
