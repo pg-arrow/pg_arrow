@@ -424,8 +424,37 @@ impl ColumnBuilder {
                 Ok(())
             }
             Self::Utf8(b) => {
-                // Use lossy conversion: non-UTF-8 bytes (e.g. Windows-1251) become
-                // replacement characters rather than NULL, preserving non-nullable columns.
+                // simd-utf8 experiment: validate with NEON, fall back to lossy on error.
+                //
+                // Microbenchmark (aarch64, Apple M-series, cargo bench --bench simd_utf8):
+                // Uses simd_compat — more precise NEON pass, no scalar fallback for valid input;
+                // consistently faster than simd_basic at short-medium sizes.
+                //
+                //   bytes    std (ns)   simd_compat  speedup
+                //       8        4.7         5.3      0.89x  ← slight overhead
+                //      16        2.7         3.2      0.84x
+                //      32        3.5         4.1      0.85x
+                //      64        4.5         2.5      1.80x  ← breakeven ~64 bytes
+                //     128        5.3         3.1      1.71x
+                //     256        7.7         4.4      1.75x
+                //     512       12.5         6.2      2.02x
+                //    1024       27.2        10.4      2.61x
+                //    4096      119.9        35.8      3.35x
+                //   16384      508.0       141.4      3.59x
+                //   65536     2051.5       540.8      3.79x
+                //
+                // End-to-end (SF10 lineitem ~60M rows, l_comment/l_shipinstruct/l_shipmode):
+                //   no measurable gain — bottleneck is I/O + Arrow buffer building, not validation.
+                //
+                // Expected win: de-TOASTed large text fields (1KB+), where NEON amortises setup.
+                // Re-evaluate once TOAST decompression is implemented.
+                #[cfg(feature = "simd-utf8")]
+                let s = match simdutf8::compat::from_utf8(bytes) {
+                    Ok(s) => std::borrow::Cow::Borrowed(s),
+                    // Invalid UTF-8 (e.g. Windows-1251): replace bad bytes with U+FFFD.
+                    Err(_) => String::from_utf8_lossy(bytes),
+                };
+                #[cfg(not(feature = "simd-utf8"))]
                 let s = String::from_utf8_lossy(bytes);
                 b.append_value(s.as_ref());
                 Ok(())

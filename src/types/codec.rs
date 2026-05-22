@@ -1,6 +1,19 @@
 use std::ffi::CStr;
 use std::sync::Arc;
 
+/// Validate UTF-8, returning `(&str, ())` on success or `(invalid_byte_offset)` on error.
+#[cfg(feature = "simd-utf8")]
+#[inline(always)]
+fn validate_utf8(bytes: &[u8]) -> Result<&str, usize> {
+    simdutf8::compat::from_utf8(bytes).map_err(|e| e.valid_up_to())
+}
+
+#[cfg(not(feature = "simd-utf8"))]
+#[inline(always)]
+fn validate_utf8(bytes: &[u8]) -> Result<&str, usize> {
+    std::str::from_utf8(bytes).map_err(|e| e.valid_up_to())
+}
+
 use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1184,12 +1197,10 @@ pub enum DecodeError {
         expected: usize,
         actual: usize,
     },
-    #[error("invalid UTF-8 in {type_name} at offset {offset}: {source}")]
+    #[error("invalid UTF-8 in {type_name} at byte offset {offset}")]
     InvalidUtf8 {
         type_name: &'static str,
         offset: usize,
-        #[source]
-        source: std::str::Utf8Error,
     },
     #[error("missing null terminator in name/cstring column")]
     MissingNulTerminator,
@@ -1414,43 +1425,28 @@ pub fn decode_varlena(type_id: PgTypeId, raw_payload: &[u8]) -> Result<PgDatum, 
     match type_id {
         // String types: validate UTF-8 and return as String
         PgTypeId::Text => {
-            let s = std::str::from_utf8(raw_payload).map_err(|e| DecodeError::InvalidUtf8 {
-                type_name: "text",
-                offset: e.valid_up_to(),
-                source: e,
-            })?;
+            let s = validate_utf8(raw_payload)
+                .map_err(|offset| DecodeError::InvalidUtf8 { type_name: "text", offset })?;
             Ok(PgDatum::Text(s.to_owned()))
         }
         PgTypeId::Varchar => {
-            let s = std::str::from_utf8(raw_payload).map_err(|e| DecodeError::InvalidUtf8 {
-                type_name: "varchar",
-                offset: e.valid_up_to(),
-                source: e,
-            })?;
+            let s = validate_utf8(raw_payload)
+                .map_err(|offset| DecodeError::InvalidUtf8 { type_name: "varchar", offset })?;
             Ok(PgDatum::Varchar(s.to_owned()))
         }
         PgTypeId::Bpchar => {
-            let s = std::str::from_utf8(raw_payload).map_err(|e| DecodeError::InvalidUtf8 {
-                type_name: "bpchar",
-                offset: e.valid_up_to(),
-                source: e,
-            })?;
+            let s = validate_utf8(raw_payload)
+                .map_err(|offset| DecodeError::InvalidUtf8 { type_name: "bpchar", offset })?;
             Ok(PgDatum::BpChar(s.to_owned()))
         }
         PgTypeId::Json => {
-            let s = std::str::from_utf8(raw_payload).map_err(|e| DecodeError::InvalidUtf8 {
-                type_name: "json",
-                offset: e.valid_up_to(),
-                source: e,
-            })?;
+            let s = validate_utf8(raw_payload)
+                .map_err(|offset| DecodeError::InvalidUtf8 { type_name: "json", offset })?;
             Ok(PgDatum::Json(s.to_owned()))
         }
         PgTypeId::Xml => {
-            let s = std::str::from_utf8(raw_payload).map_err(|e| DecodeError::InvalidUtf8 {
-                type_name: "xml",
-                offset: e.valid_up_to(),
-                source: e,
-            })?;
+            let s = validate_utf8(raw_payload)
+                .map_err(|offset| DecodeError::InvalidUtf8 { type_name: "xml", offset })?;
             Ok(PgDatum::Xml(s.to_owned()))
         }
         // Binary-blob types: copy raw bytes
@@ -1603,7 +1599,6 @@ pub fn decode_datum(
             let s = cstr.to_str().map_err(|e| DecodeError::InvalidUtf8 {
                 type_name: "cstring",
                 offset: e.valid_up_to(),
-                source: e,
             })?;
             let consumed = s.len() + 1; // include the null terminator
             Ok((PgDatum::Text(s.to_owned()), consumed))

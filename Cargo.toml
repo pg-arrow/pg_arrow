@@ -11,6 +11,9 @@ readme = "README.md"
 keywords = ["postgres", "postgresql", "arrow", "heap", "parser"]
 categories = ["database", "parser-implementations", "encoding"]
 
+[features]
+simd-utf8 = ["dep:simdutf8"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
@@ -23,6 +26,7 @@ tokio = { version = "1", features = ["fs", "io-util", "rt"] }
 futures = "0.3"
 libc = "0.2"
 bytes = "1"
+simdutf8 = { version = "0.1", optional = true, features = ["aarch64_neon"] }
 
 [dev-dependencies]
 criterion = "0.8"
@@ -31,6 +35,10 @@ pg-test-harness = { git = "https://github.com/pg-arrow/utils.git", rev = "34dc2a
 
 [[bench]]
 name = "criterion_bench"
+harness = false
+
+[[bench]]
+name = "simd_utf8"
 harness = false
 
 [[bench]]
